@@ -273,25 +273,65 @@ def backup_kernel():
             shutil.copy2(src, os.path.join(dest, name))
     return ver
 
+BOOT_RESTORED_MARKER = os.path.join(MOUNT_POINT, ".bread_restored_kernel")
+
+def _remove_kernel_from_boot(ver):
+    """Remove a kernel's files from /boot."""
+    mid = get_machine_id()
+    for path in [
+        f"/boot/vmlinuz-{ver}",
+        f"/boot/initramfs-{ver}.img",
+        f"/boot/loader/entries/{mid}-{ver}.conf",
+    ]:
+        if os.path.exists(path):
+            os.remove(path)
+
+def _clean_previous_restore():
+    """Remove the previously bread-restored kernel from /boot, if any."""
+    if not os.path.exists(BOOT_RESTORED_MARKER):
+        return
+    with open(BOOT_RESTORED_MARKER) as f:
+        prev_ver = f.read().strip()
+    if prev_ver and os.path.exists(f"/boot/vmlinuz-{prev_ver}"):
+        _remove_kernel_from_boot(prev_ver)
+        print(f"  Removed previous bread kernel {prev_ver} from /boot")
+
 def restore_kernel(ver):
-    """Restore kernel from _bread_boot/ to /boot if not already present."""
+    """Restore kernel from _bread_boot/ to /boot.
+    Removes any previously bread-restored kernel first, then sets GRUB default."""
     src_dir = os.path.join(BOOT_BACKUP_DIR, ver)
     if not os.path.exists(src_dir):
         return False
-    if os.path.exists(f"/boot/vmlinuz-{ver}"):
-        return True  # Already in /boot
-    import shutil
-    mid = get_machine_id()
-    restores = {
-        "vmlinuz": f"/boot/vmlinuz-{ver}",
-        "initramfs.img": f"/boot/initramfs-{ver}.img",
-        "bls.conf": f"/boot/loader/entries/{mid}-{ver}.conf",
-    }
-    for name, dst in restores.items():
-        src = os.path.join(src_dir, name)
-        if os.path.exists(src):
-            shutil.copy2(src, dst)
-    print(f"  Restored kernel {ver} to /boot")
+
+    # Clean up previous bread-restored kernel (keep only one at a time)
+    _clean_previous_restore()
+
+    # Restore if not already in /boot (may already be there as a system kernel)
+    if not os.path.exists(f"/boot/vmlinuz-{ver}"):
+        import shutil
+        mid = get_machine_id()
+        restores = {
+            "vmlinuz": f"/boot/vmlinuz-{ver}",
+            "initramfs.img": f"/boot/initramfs-{ver}.img",
+            "bls.conf": f"/boot/loader/entries/{mid}-{ver}.conf",
+        }
+        for name, dst in restores.items():
+            src = os.path.join(src_dir, name)
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+        print(f"  Restored kernel {ver} to /boot")
+
+        # Track what we put in /boot
+        with open(BOOT_RESTORED_MARKER, 'w') as f:
+            f.write(ver)
+    else:
+        # Kernel already in /boot (system-managed), clear marker
+        if os.path.exists(BOOT_RESTORED_MARKER):
+            os.remove(BOOT_RESTORED_MARKER)
+
+    # Set as default boot entry
+    subprocess.run(["grubby", "--set-default", f"/boot/vmlinuz-{ver}"], check=True)
+    print(f"  Set default boot kernel: {ver}")
     return True
 
 def snapshot_kernel_version(ts_str):
@@ -865,10 +905,13 @@ def main():
                 os.remove(os.path.join(lib.SNAP_DIR, f))
         os.rmdir(lib.SNAP_DIR)
 
-    # Delete kernel backups
+    # Remove bread-restored kernel from /boot and clean up backups
+    lib._clean_previous_restore()
     import shutil
     if os.path.exists(lib.BOOT_BACKUP_DIR):
         shutil.rmtree(lib.BOOT_BACKUP_DIR)
+    if os.path.exists(lib.BOOT_RESTORED_MARKER):
+        os.remove(lib.BOOT_RESTORED_MARKER)
     print("Kernel backups removed.")
 
     # Delete undo buffer
