@@ -13,41 +13,33 @@ Config: `/etc/bread.json` | Log: `/var/log/bread.log`
 ### 1. File Structure
 
 ```text
-/
-├── usr/
-│   └── local/
-│       ├── bin/
-│       │   ├── bread                # CLI entry point
-│       │   └── bread-gui            # GUI entry point
-│       └── lib/
-│           └── bread/
-│               ├── __init__.py
-│               ├── lib.py           # Shared: config, locking, btrfs ops, discovery
-│               ├── cli/
-│               │   ├── __init__.py
-│               │   ├── main.py      # CLI dispatcher
-│               │   ├── config.py    # Interactive config wizard
-│               │   ├── snapshot.py  # CLI snapshot wrapper
-│               │   ├── rollback.py  # fdisk-style command loop
-│               │   └── revert.py    # CLI revert wrapper
-│               └── gui/
-│                   ├── __init__.py
-│                   ├── app.py       # GTK application
-│                   ├── wizard.py    # First-run config wizard dialog
-│                   └── window.py    # Main window (snapshot table)
-├── etc/
-│   └── systemd/
-│       └── system/
-│           ├── bread-snapshot.service
-│           └── bread-snapshot.timer
-├── usr/
-│   └── share/
-│       ├── polkit-1/
-│       │   └── actions/
-│       │       └── org.bread.policy # Privilege elevation policy
-│       └── applications/
-│           └── bread.desktop        # Desktop launcher
-├── install.sh
+/usr/
+├── bin/
+│   ├── bread                            # CLI entry point
+│   └── bread-gui                        # GUI entry point
+├── lib/python3/site-packages/bread/
+│   ├── __init__.py
+│   ├── lib.py                           # Shared: config, locking, btrfs ops, discovery
+│   ├── cli/
+│   │   ├── __init__.py
+│   │   ├── main.py                      # CLI dispatcher
+│   │   ├── config.py                    # Interactive config wizard
+│   │   ├── snapshot.py                  # Snapshot creation + pruning
+│   │   ├── rollback.py                  # fdisk-style command loop + execution
+│   │   └── revert.py                    # Undo execution
+│   └── gui/
+│       ├── __init__.py
+│       ├── app.py                       # GTK application
+│       ├── wizard.py                    # First-run config wizard dialog
+│       └── window.py                    # Main window (snapshot table)
+├── share/
+│   ├── polkit-1/actions/
+│   │   └── org.bread.policy             # Privilege elevation policy
+│   └── applications/
+│       └── bread.desktop                # Desktop launcher
+/etc/systemd/system/
+├── bread-snapshot.service
+└── bread-snapshot.timer
 ```
 
 ---
@@ -81,8 +73,6 @@ buffer). The systemd timer handles scheduled snapshot creation.
 #!/usr/bin/env python3
 import sys
 import importlib
-
-sys.path.insert(0, "/usr/local/lib")
 
 USAGE = """Usage: bread <command> [options]
 
@@ -132,27 +122,37 @@ LOCK_FILE = "/var/lock/bread.lock"
 DEFAULT_CONF = {
     "mount_point": "/mnt/btrfs_pool",
     "snapshot_dir_name": "_btrbk_snap",
-    "retention": {"hourly": 48, "daily": 14, "weekly": 4, "monthly": 6},
-    "safety_retention": 3,
-    "broken_retention": 1
 }
 
 def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                conf = json.load(f)
-                for k, v in DEFAULT_CONF.items():
-                    if k not in conf: conf[k] = v
-                return conf
-        except Exception: return DEFAULT_CONF
-    return DEFAULT_CONF
+    if not os.path.exists(CONFIG_FILE):
+        return None
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return None
 
-CONF = load_config()
-MOUNT_POINT = CONF["mount_point"]
-SNAP_DIR = os.path.join(MOUNT_POINT, CONF["snapshot_dir_name"])
-OLD_DIR = os.path.join(MOUNT_POINT, "old")
+def require_config():
+    """Load config or exit if not found. Call from commands that need it."""
+    conf = load_config()
+    if conf is None:
+        sys.exit("No configuration found. Run 'bread config' first.")
+    return conf
+
+CONF = None
+MOUNT_POINT = None
+SNAP_DIR = None
+OLD_DIR = None
 TEMP_SUFFIX = "_swap_tmp"
+
+def init():
+    """Initialize globals from config. Called by commands that need config."""
+    global CONF, MOUNT_POINT, SNAP_DIR, OLD_DIR
+    CONF = require_config()
+    MOUNT_POINT = CONF["mount_point"]
+    SNAP_DIR = os.path.join(MOUNT_POINT, CONF["snapshot_dir_name"])
+    OLD_DIR = os.path.join(MOUNT_POINT, "old")
 
 class SignalShield:
     def __enter__(self):
@@ -247,6 +247,38 @@ def discover_subvolumes():
             subvols.append(item)
     return sorted(subvols)
 
+def format_ts(ts_str):
+    """Convert internal timestamp (YYYYMMDDTHHMMSS) to human-readable."""
+    for fmt_in, fmt_out in [("%Y%m%dT%H%M%S", "%Y-%m-%d %H:%M:%S"),
+                             ("%Y%m%dT%H%M", "%Y-%m-%d %H:%M")]:
+        try: return datetime.strptime(ts_str, fmt_in).strftime(fmt_out)
+        except ValueError: continue
+    return ts_str
+
+def build_snapshot_table():
+    """Scan snapshot dir. Returns [(ts_str, [subvols]), ...] sorted oldest-first.
+    Position in list (1-indexed) = stable session ID."""
+    from collections import defaultdict
+    if not os.path.exists(SNAP_DIR):
+        return []
+
+    timestamps = defaultdict(list)
+    for fname in os.listdir(SNAP_DIR):
+        if "SAFETY" in fname or "BROKEN" in fname:
+            continue
+        m = re.match(r'^(.+)\.(\d{8}T(?:\d{6}|\d{4}))$', fname)
+        if not m:
+            continue
+        subvol, ts_str = m.groups()
+        for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M"):
+            try:
+                datetime.strptime(ts_str, fmt)
+                timestamps[ts_str].append(subvol)
+                break
+            except ValueError: continue
+
+    return [(ts, sorted(subs)) for ts, subs in sorted(timestamps.items())]
+
 def validate_name(name):
     if not re.match(r'^[a-zA-Z0-9_\-.]+$', name) or '..' in name:
         raise ValueError(f"Invalid name '{name}'. Use alphanumeric, _, -, .")
@@ -261,18 +293,25 @@ import os
 import sys
 import json
 import copy
+import subprocess
 from bread import lib
 
 def ask(prompt, default):
     val = input(f"{prompt} [{default}]: ").strip()
     return val if val else default
 
-def ask_int(prompt, default):
+def ask_int(prompt, default=None):
     while True:
-        val = input(f"{prompt} [{default}]: ").strip()
-        if not val: return default
-        if val.isdigit(): return int(val)
-        print("Integer required.")
+        if default is not None:
+            val = input(f"{prompt} [{default}]: ").strip()
+            if not val: return default
+        else:
+            val = input(f"{prompt}: ").strip()
+            if not val:
+                print("Value required.")
+                continue
+        if val.isdigit() and int(val) >= 0: return int(val)
+        print("Non-negative integer required.")
 
 def main():
     if os.geteuid() != 0: sys.exit("Root required.")
@@ -289,13 +328,14 @@ def main():
     except ValueError as e:
         sys.exit(f"Error: {e}")
 
-    print("\n[ Retention ]")
-    conf["retention"]["hourly"] = ask_int("Hourly", 48)
-    conf["retention"]["daily"] = ask_int("Daily", 14)
-    conf["retention"]["weekly"] = ask_int("Weekly", 4)
-    conf["retention"]["monthly"] = ask_int("Monthly", 6)
-    conf["safety_retention"] = ask_int("Safety Snapshots", 3)
-    conf["broken_retention"] = ask_int("Broken Snapshots", 1)
+    print("\n[ Retention (number of snapshots to keep per period) ]")
+    conf["retention"] = {}
+    conf["retention"]["hourly"] = ask_int("Hourly")
+    conf["retention"]["daily"] = ask_int("Daily")
+    conf["retention"]["weekly"] = ask_int("Weekly")
+    conf["retention"]["monthly"] = ask_int("Monthly")
+    conf["safety_retention"] = ask_int("Safety Snapshots")
+    conf["broken_retention"] = ask_int("Broken Snapshots")
 
     if not os.path.ismount(conf["mount_point"]):
         print(f"\n! WARNING: {conf['mount_point']} is not a mount point.")
@@ -308,6 +348,10 @@ def main():
         print("Configuration saved.")
     except Exception as e:
         sys.exit(f"Error: {e}")
+
+    if input("\nEnable hourly snapshots? (Y/n): ").strip().lower() in ('', 'y', 'yes'):
+        subprocess.run(["systemctl", "enable", "--now", "bread-snapshot.timer"], check=False)
+        print("Timer enabled.")
 ```
 
 ---
@@ -413,6 +457,7 @@ def main():
     DRY_RUN = args.dry_run
 
     if os.geteuid() != 0 and not DRY_RUN: sys.exit("Root required.")
+    lib.init()
 
     with lib.LockManager():
         for sub in lib.discover_subvolumes():
@@ -487,46 +532,13 @@ for individual selection (e.g. `2,3`).
 ```python
 import os
 import sys
-import re
 import shutil
 import argparse
 import subprocess
-from collections import defaultdict
 from datetime import datetime
 from bread import lib
 
 DRY_RUN = False
-
-def format_ts(ts_str):
-    """Convert internal timestamp (YYYYMMDDTHHMMSS) to human-readable."""
-    for fmt_in, fmt_out in [("%Y%m%dT%H%M%S", "%Y-%m-%d %H:%M:%S"),
-                             ("%Y%m%dT%H%M", "%Y-%m-%d %H:%M")]:
-        try: return datetime.strptime(ts_str, fmt_in).strftime(fmt_out)
-        except ValueError: continue
-    return ts_str
-
-def build_snapshot_table():
-    """Scan snapshot dir. Returns [(ts_str, [subvols]), ...] sorted oldest-first.
-    Position in list (1-indexed) = stable session ID."""
-    if not os.path.exists(lib.SNAP_DIR):
-        return []
-
-    timestamps = defaultdict(list)
-    for fname in os.listdir(lib.SNAP_DIR):
-        if "SAFETY" in fname or "BROKEN" in fname:
-            continue
-        m = re.match(r'^(.+)\.(\d{8}T(?:\d{6}|\d{4}))$', fname)
-        if not m:
-            continue
-        subvol, ts_str = m.groups()
-        for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M"):
-            try:
-                datetime.strptime(ts_str, fmt)
-                timestamps[ts_str].append(subvol)
-                break
-            except ValueError: continue
-
-    return [(ts, sorted(subs)) for ts, subs in sorted(timestamps.items())]
 
 def print_table(table, show_all=False):
     """Print snapshot table. Default: last 10. show_all: everything."""
@@ -538,7 +550,7 @@ def print_table(table, show_all=False):
     for i in range(start, len(table)):
         num = i + 1
         ts_str, subvols = table[i]
-        print(f"  {num:>4}  {format_ts(ts_str):<21}  {', '.join(subvols)}")
+        print(f"  {num:>4}  {lib.format_ts(ts_str):<21}  {', '.join(subvols)}")
 
 def select_subvolumes(available):
     """Prompt for subvolume selection. Enter = All. Supports comma-separated."""
@@ -595,12 +607,12 @@ def command_loop(table):
                 num = int(cmd)
                 if 1 <= num <= len(table):
                     ts_str, subvols = table[num - 1]
-                    print(f"\nSelected: {format_ts(ts_str)}")
+                    print(f"\nSelected: {lib.format_ts(ts_str)}")
                     selected = select_subvolumes(subvols)
 
                     print("\nRollback Plan:")
                     for sub in selected:
-                        print(f"  {sub}  →  {format_ts(ts_str)}")
+                        print(f"  {sub}  →  {lib.format_ts(ts_str)}")
 
                     confirm = input("\nConfirm? (y/N): ").strip().lower()
                     if confirm == "y":
@@ -738,10 +750,11 @@ def main():
     DRY_RUN = args.dry_run
 
     if os.geteuid() != 0 and not DRY_RUN: sys.exit("Root required.")
+    lib.init()
     lib.check_mount_sanity()
     lib.check_fstab_safety()
 
-    table = build_snapshot_table()
+    table = lib.build_snapshot_table()
     plan = command_loop(table)
     if not plan: sys.exit("Cancelled.")
 
@@ -771,6 +784,7 @@ def main():
     DRY_RUN = args.dry_run
 
     if os.geteuid() != 0 and not DRY_RUN: sys.exit("Root required.")
+    lib.init()
 
     lib.check_mount_sanity()
     lib.check_fstab_safety()
@@ -945,7 +959,7 @@ transitions to the main window.
 - All checkboxes checked by default
 - "All (Recommended)" toggles all others
 - Unchecking a subvolume unchecks "All (Recommended)"
-- Clicking Rollback calls `pkexec bread rollback ...` (core execution, elevated)
+- Clicking Rollback calls `pkexec bread rollback ...` (elevated)
 - On success: dialog with "Rollback complete. Reboot now?" [Later] [Reboot]
 - On error: dialog showing the error message
 
@@ -960,7 +974,6 @@ transitions to the main window.
 ```python
 #!/usr/bin/env python3
 import sys
-sys.path.insert(0, "/usr/local/lib")
 from bread.gui.app import BreadApp
 BreadApp().run(sys.argv)
 ```
@@ -986,7 +999,7 @@ BreadApp().run(sys.argv)
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>auth_admin</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/bread</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/bread</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>
@@ -1009,49 +1022,69 @@ Categories=System;
 
 ---
 
-### 12. Installer (`install.sh`)
+### 12. RPM Spec (`bread.spec`)
 
-```bash
-#!/bin/bash
-if [ "$EUID" -ne 0 ]; then
-  echo "Please run as root"
-  exit 1
-fi
+```spec
+Name:           bread
+Version:        0.1.0
+Release:        1%{?dist}
+Summary:        Btrfs snapshot manager with CLI and GUI
 
-echo "Installing Bread Suite..."
+License:        GPL-3.0-or-later
+URL:            https://github.com/user/bread
+Source0:        %{name}-%{version}.tar.gz
 
-# Shared library
-mkdir -p /usr/local/lib/bread
-cp bread/__init__.py bread/lib.py /usr/local/lib/bread/
-chmod 644 /usr/local/lib/bread/*.py
+Requires:       python3
+Requires:       btrfs-progs
+Requires:       gtk4
+Requires:       polkit
 
-# CLI
-mkdir -p /usr/local/lib/bread/cli
-cp bread/cli/__init__.py bread/cli/main.py bread/cli/config.py bread/cli/snapshot.py bread/cli/rollback.py bread/cli/revert.py /usr/local/lib/bread/cli/
-chmod 644 /usr/local/lib/bread/cli/*.py
+BuildArch:      noarch
 
-cp bin/bread /usr/local/bin/bread
-chmod +x /usr/local/bin/bread
+%description
+Bread is a Btrfs snapshot manager. It provides automatic hourly snapshots
+with configurable retention, interactive rollback (CLI and GTK GUI), and
+one-level undo. The CLI uses an fdisk-style command loop. The GUI elevates
+via pkexec for privileged operations.
 
-# GUI
-mkdir -p /usr/local/lib/bread/gui
-cp bread/gui/__init__.py bread/gui/app.py bread/gui/wizard.py bread/gui/window.py /usr/local/lib/bread/gui/
-chmod 644 /usr/local/lib/bread/gui/*.py
+%install
+mkdir -p %{buildroot}%{_bindir}
+install -m 755 bin/bread %{buildroot}%{_bindir}/bread
+install -m 755 bin/bread-gui %{buildroot}%{_bindir}/bread-gui
 
-cp bin/bread-gui /usr/local/bin/bread-gui
-chmod +x /usr/local/bin/bread-gui
+mkdir -p %{buildroot}%{python3_sitelib}/bread/cli
+mkdir -p %{buildroot}%{python3_sitelib}/bread/gui
+cp -a bread/*.py %{buildroot}%{python3_sitelib}/bread/
+cp -a bread/cli/*.py %{buildroot}%{python3_sitelib}/bread/cli/
+cp -a bread/gui/*.py %{buildroot}%{python3_sitelib}/bread/gui/
 
-# Polkit + Desktop
-cp org.bread.policy /usr/share/polkit-1/actions/
-cp bread.desktop /usr/share/applications/
+mkdir -p %{buildroot}%{_unitdir}
+install -m 644 bread-snapshot.service %{buildroot}%{_unitdir}/
+install -m 644 bread-snapshot.timer %{buildroot}%{_unitdir}/
 
-# Systemd
-cp bread-snapshot.service bread-snapshot.timer /etc/systemd/system/
-systemctl daemon-reload
+mkdir -p %{buildroot}%{_datadir}/polkit-1/actions
+install -m 644 org.bread.policy %{buildroot}%{_datadir}/polkit-1/actions/
 
-echo "Installation Complete."
-echo "1. Run 'bread config' or launch Bread from your application menu."
-echo "2. Enable: systemctl enable --now bread-snapshot.timer"
+mkdir -p %{buildroot}%{_datadir}/applications
+install -m 644 bread.desktop %{buildroot}%{_datadir}/applications/
+
+%post
+systemctl daemon-reload 2>/dev/null || :
+
+%preun
+%systemd_preun bread-snapshot.timer bread-snapshot.service
+
+%postun
+%systemd_postun_with_restart bread-snapshot.timer
+
+%files
+%{_bindir}/bread
+%{_bindir}/bread-gui
+%{python3_sitelib}/bread/
+%{_unitdir}/bread-snapshot.service
+%{_unitdir}/bread-snapshot.timer
+%{_datadir}/polkit-1/actions/org.bread.policy
+%{_datadir}/applications/bread.desktop
 ```
 
 ---
@@ -1066,7 +1099,7 @@ Description=Run Bread snapshot engine
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/bread snapshot
+ExecStart=/usr/bin/bread snapshot
 Nice=19
 IOSchedulingClass=idle
 IOSchedulingPriority=7
