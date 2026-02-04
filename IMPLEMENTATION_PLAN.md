@@ -148,6 +148,7 @@ MOUNT_POINT = "/mnt/_bread"
 SNAP_DIR_NAME = "_bread_snapshots"
 SNAP_DIR = os.path.join(MOUNT_POINT, SNAP_DIR_NAME)
 OLD_DIR = os.path.join(MOUNT_POINT, "old")
+BOOT_BACKUP_DIR = os.path.join(MOUNT_POINT, "_bread_boot")
 
 CONF = None
 
@@ -210,7 +211,7 @@ def btrfs_list():
 
 def discover_subvolumes():
     """Find live subvolumes (top-level children, excluding bread internals)."""
-    exclude = {SNAP_DIR_NAME, "old", "lost+found"}
+    exclude = {SNAP_DIR_NAME, "_bread_boot", "old", "lost+found"}
     return sorted([
         path for path, top in btrfs_list()
         if top == "5" and "/" not in path and path not in exclude
@@ -246,6 +247,97 @@ def build_snapshot_table():
             except ValueError: continue
 
     return [(ts, sorted(subs)) for ts, subs in sorted(timestamps.items())]
+
+def get_machine_id():
+    """Read machine-id for BLS entry filenames."""
+    with open("/etc/machine-id") as f:
+        return f.read().strip()
+
+def backup_kernel():
+    """Backup current kernel to _bread_boot/ if not already present.
+    Returns the kernel version string."""
+    ver = os.uname().release
+    dest = os.path.join(BOOT_BACKUP_DIR, ver)
+    if os.path.exists(dest):
+        return ver
+    os.makedirs(dest, exist_ok=True)
+    mid = get_machine_id()
+    files = {
+        f"/boot/vmlinuz-{ver}": "vmlinuz",
+        f"/boot/initramfs-{ver}.img": "initramfs.img",
+        f"/boot/loader/entries/{mid}-{ver}.conf": "bls.conf",
+    }
+    import shutil
+    for src, name in files.items():
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dest, name))
+    return ver
+
+def restore_kernel(ver):
+    """Restore kernel from _bread_boot/ to /boot if not already present."""
+    src_dir = os.path.join(BOOT_BACKUP_DIR, ver)
+    if not os.path.exists(src_dir):
+        return False
+    if os.path.exists(f"/boot/vmlinuz-{ver}"):
+        return True  # Already in /boot
+    import shutil
+    mid = get_machine_id()
+    restores = {
+        "vmlinuz": f"/boot/vmlinuz-{ver}",
+        "initramfs.img": f"/boot/initramfs-{ver}.img",
+        "bls.conf": f"/boot/loader/entries/{mid}-{ver}.conf",
+    }
+    for name, dst in restores.items():
+        src = os.path.join(src_dir, name)
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+    print(f"  Restored kernel {ver} to /boot")
+    return True
+
+def snapshot_kernel_version(ts_str):
+    """Read the kernel version marker for a snapshot timestamp."""
+    marker = os.path.join(SNAP_DIR, f".kernel.{ts_str}")
+    if os.path.exists(marker):
+        with open(marker) as f:
+            return f.read().strip()
+    return None
+
+def write_kernel_marker(ts_str, ver):
+    """Write kernel version marker for a snapshot timestamp."""
+    marker = os.path.join(SNAP_DIR, f".kernel.{ts_str}")
+    with open(marker, 'w') as f:
+        f.write(ver)
+
+def prune_kernel_backups():
+    """Remove orphaned kernel markers and unreferenced kernel backups."""
+    if not os.path.exists(SNAP_DIR):
+        return
+    # Find which timestamps still have snapshots
+    live_timestamps = set()
+    for fname in os.listdir(SNAP_DIR):
+        m = re.match(r'^.+\.(\d{8}T(?:\d{6}|\d{4}))$', fname)
+        if m:
+            live_timestamps.add(m.group(1))
+    # Remove orphaned kernel markers, collect referenced kernel versions
+    referenced = set()
+    for fname in os.listdir(SNAP_DIR):
+        if not fname.startswith(".kernel."):
+            continue
+        ts = fname[len(".kernel."):]
+        path = os.path.join(SNAP_DIR, fname)
+        if ts not in live_timestamps:
+            os.remove(path)
+        else:
+            with open(path) as f:
+                referenced.add(f.read().strip())
+    # Remove unreferenced kernel backups
+    if not os.path.exists(BOOT_BACKUP_DIR):
+        return
+    import shutil
+    for ver in os.listdir(BOOT_BACKUP_DIR):
+        if ver not in referenced:
+            shutil.rmtree(os.path.join(BOOT_BACKUP_DIR, ver))
+            print(f"  Removed kernel backup {ver}")
 
 ```
 
@@ -447,12 +539,21 @@ def main():
 
     lib.init()
 
+    now = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     for sub in lib.discover_subvolumes():
         try:
             create_snapshot(sub)
             prune_snapshots(sub)
         except Exception:
             STATS['errors'] += 1
+
+    # Backup current kernel and write marker for this timestamp
+    if STATS['created'] > 0:
+        ver = lib.backup_kernel()
+        lib.write_kernel_marker(now, ver)
+
+    # Clean up kernel backups no longer referenced by any snapshot
+    lib.prune_kernel_backups()
 
     print(f"Created {STATS['created']} | Pruned {STATS['pruned']} | Errors {STATS['errors']}")
 ```
@@ -604,8 +705,16 @@ def command_loop(table):
             except ValueError:
                 print("  Unknown command. Type 'm' for help.")
 
-def execute_rollback(plan):
+def execute_rollback(plan, ts_str):
     """Execute the rollback plan."""
+    # Restore kernel to /boot if needed
+    ver = lib.snapshot_kernel_version(ts_str)
+    if ver:
+        if not lib.restore_kernel(ver):
+            sys.exit(f"Error: kernel {ver} backup not found. Cannot safely roll back.")
+    else:
+        print("  Warning: no kernel marker for this snapshot (pre-boot-backup snapshot)")
+
     # Clear undo buffer
     if os.path.exists(lib.OLD_DIR):
         for item in os.listdir(lib.OLD_DIR):
@@ -663,8 +772,9 @@ def main():
         # Interactive mode
         plan = command_loop(table)
         if not plan: sys.exit("Cancelled.")
+        ts_str = next(iter(plan.values()))  # All entries share same timestamp
 
-    execute_rollback(plan)
+    execute_rollback(plan, ts_str)
 ```
 
 ---
@@ -746,10 +856,20 @@ def main():
     subprocess.run(["systemctl", "disable", "--now", "bread-snapshot.timer"], check=False)
     print("Timer disabled.")
 
-    # Delete all snapshots
+    # Delete all snapshots and kernel markers
     delete_subvolumes_in(lib.SNAP_DIR)
     if os.path.exists(lib.SNAP_DIR):
+        # Remove kernel marker files
+        for f in os.listdir(lib.SNAP_DIR):
+            if f.startswith(".kernel."):
+                os.remove(os.path.join(lib.SNAP_DIR, f))
         os.rmdir(lib.SNAP_DIR)
+
+    # Delete kernel backups
+    import shutil
+    if os.path.exists(lib.BOOT_BACKUP_DIR):
+        shutil.rmtree(lib.BOOT_BACKUP_DIR)
+    print("Kernel backups removed.")
 
     # Delete undo buffer
     delete_subvolumes_in(lib.OLD_DIR)
