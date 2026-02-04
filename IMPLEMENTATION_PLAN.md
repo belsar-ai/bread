@@ -1,4 +1,4 @@
-# Bread Suite
+# Bread
 
 Two applications: **CLI** and **GUI**, sharing a common library.
 
@@ -6,7 +6,7 @@ Two applications: **CLI** and **GUI**, sharing a common library.
 - **CLI**: fdisk-style interactive tool. Contains all snapshot/rollback/revert logic. Entry point: `bread <subcommand>`
 - **GUI**: GTK application. Reads filesystem for display, calls `pkexec bread <subcommand>` for privileged operations. Entry point: `bread-gui`
 
-Config: `/etc/bread.json` | Log: `/var/log/bread.log`
+Config: `/etc/bread.json`
 
 ---
 
@@ -19,14 +19,15 @@ Config: `/etc/bread.json` | Log: `/var/log/bread.log`
 │   └── bread-gui                        # GUI entry point
 ├── lib/python3/site-packages/bread/
 │   ├── __init__.py
-│   ├── lib.py                           # Shared: config, locking, btrfs ops, discovery
+│   ├── lib.py                           # Shared: config, btrfs ops, discovery
 │   ├── cli/
 │   │   ├── __init__.py
 │   │   ├── main.py                      # CLI dispatcher
 │   │   ├── config.py                    # Interactive config wizard
 │   │   ├── snapshot.py                  # Snapshot creation + pruning
 │   │   ├── rollback.py                  # fdisk-style command loop + execution
-│   │   └── revert.py                    # Undo execution
+│   │   ├── revert.py                    # Undo execution
+│   │   └── purge.py                     # Remove all bread data
 │   └── gui/
 │       ├── __init__.py
 │       ├── app.py                       # GTK application
@@ -48,12 +49,12 @@ Config: `/etc/bread.json` | Log: `/var/log/bread.log`
 
 **Shared library** (`bread/lib.py`):
 
-Config loading, constants, btrfs helpers (`is_btrfs_subvolume`, `run_cmd`),
-`discover_subvolumes()`, locking, signal shielding. Imported by both CLI and GUI.
+Config loading, constants, btrfs helpers (`run_cmd`, `btrfs_list`),
+`discover_subvolumes()`, `build_snapshot_table()`. Imported by both CLI and GUI.
 
 **CLI** (`bread/cli/`):
 
-All snapshot, rollback, and revert logic lives here. Interactive prompts, argparse,
+All snapshot, rollback, and revert logic lives here. Interactive prompts,
 print output. The CLI is the complete implementation.
 
 **GUI** (`bread/gui/`):
@@ -67,34 +68,36 @@ buffer). The systemd timer handles scheduled snapshot creation.
 
 ---
 
-### 3. Dispatcher (`/usr/local/bin/bread`)
+### 3. Dispatcher (`/usr/bin/bread`)
 
 ```python
 #!/usr/bin/env python3
 import sys
+import argparse
 import importlib
 
-USAGE = """Usage: bread <command> [options]
-
-Commands:
-  config     Setup wizard
-  snapshot   Create snapshots and prune old ones
-  rollback   Interactive snapshot recovery
-  revert     Undo last rollback"""
+COMMANDS = {
+    "config":   "Setup wizard",
+    "snapshot": "Create snapshots and prune old ones",
+    "rollback": "Interactive snapshot recovery",
+    "revert":   "Undo last rollback",
+    "purge":    "Remove all bread data and config",
+}
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print(USAGE)
-        sys.exit(0)
+    parser = argparse.ArgumentParser(prog="bread", description="Btrfs snapshot manager")
+    parser.add_argument("command", choices=COMMANDS.keys(),
+                        metavar="command",
+                        help="{%(choices)s}")
+    parser.add_argument("args", nargs=argparse.REMAINDER)
 
-    cmd = sys.argv[1]
-    if cmd not in ("config", "snapshot", "rollback", "revert"):
-        print(f"Unknown command: {cmd}", file=sys.stderr)
-        print(USAGE, file=sys.stderr)
+    if len(sys.argv) < 2:
+        parser.print_help()
         sys.exit(1)
 
-    sys.argv = sys.argv[1:]  # shift so subcommand's argparse sees its own args
-    mod = importlib.import_module(f"bread.cli.{cmd}")
+    args = parser.parse_args()
+    sys.argv = [args.command] + args.args
+    mod = importlib.import_module(f"bread.cli.{args.command}")
     mod.main()
 
 if __name__ == "__main__":
@@ -109,20 +112,18 @@ if __name__ == "__main__":
 import os
 import sys
 import json
-import fcntl
 import subprocess
-import signal
 import re
+from collections import defaultdict
 from datetime import datetime
 
 CONFIG_FILE = "/etc/bread.json"
-LOG_FILE = "/var/log/bread.log"
-LOCK_FILE = "/var/lock/bread.lock"
+MOUNT_POINT = "/mnt/_bread"
+SNAP_DIR_NAME = "_bread_snapshots"
+SNAP_DIR = os.path.join(MOUNT_POINT, SNAP_DIR_NAME)
+OLD_DIR = os.path.join(MOUNT_POINT, "old")
 
-DEFAULT_CONF = {
-    "mount_point": "/mnt/btrfs_pool",
-    "snapshot_dir_name": "_btrbk_snap",
-}
+CONF = None
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -133,76 +134,18 @@ def load_config():
     except Exception:
         return None
 
-def require_config():
-    """Load config or exit if not found. Call from commands that need it."""
-    conf = load_config()
-    if conf is None:
-        sys.exit("No configuration found. Run 'bread config' first.")
-    return conf
-
-CONF = None
-MOUNT_POINT = None
-SNAP_DIR = None
-OLD_DIR = None
-TEMP_SUFFIX = "_swap_tmp"
-
 def init():
-    """Initialize globals from config. Called by commands that need config."""
-    global CONF, MOUNT_POINT, SNAP_DIR, OLD_DIR
-    CONF = require_config()
-    MOUNT_POINT = CONF["mount_point"]
-    SNAP_DIR = os.path.join(MOUNT_POINT, CONF["snapshot_dir_name"])
-    OLD_DIR = os.path.join(MOUNT_POINT, "old")
+    """Load config into CONF global. Called by commands that need config."""
+    global CONF
+    CONF = load_config()
+    if CONF is None:
+        sys.exit("No configuration found. Run 'bread config' first.")
 
-class SignalShield:
-    def __enter__(self):
-        self.orig_int = signal.getsignal(signal.SIGINT)
-        self.orig_term = signal.getsignal(signal.SIGTERM)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        return self
-    def __exit__(self, exc_type, exc_value, tb):
-        signal.signal(signal.SIGINT, self.orig_int)
-        signal.signal(signal.SIGTERM, self.orig_term)
-
-class LockManager:
-    def __enter__(self):
-        self.fd = None
-        self.lock_fd = None
-        try:
-            self.fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
-            self.lock_fd = os.fdopen(self.fd, 'w')
-            fcntl.lockf(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return self.lock_fd
-        except (IOError, OSError):
-            if self.lock_fd: self.lock_fd.close()
-            elif self.fd: os.close(self.fd)
-            sys.exit("Error: Locked. Is another bread command running?")
-
-    def __exit__(self, exc_type, exc_value, tb):
-        if self.lock_fd: self.lock_fd.close()
-
-def log(msg, console=True, dry_run=False):
-    prefix = "[DRY RUN] " if dry_run else ""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    entry = f"[{ts}] {prefix}{msg}"
-    if os.geteuid() == 0 and not dry_run:
-        try:
-            with open(LOG_FILE, "a") as f: f.write(entry + "\n")
-        except Exception: pass
-    if console: print(f"{prefix}{msg}")
-
-def run_cmd(cmd, desc=None, check=True, dry_run=False):
-    if dry_run:
-        log(f"Would execute: {' '.join(cmd)}", dry_run=True)
-        return
-    if desc: log(desc)
+def run_cmd(cmd, check=True):
     try:
         subprocess.run(cmd, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
-        err_msg = e.stderr.decode().strip()
-        log(f"Command failed: {' '.join(cmd)}\nStderr: {err_msg}", console=False)
-        print(f"Error: {err_msg}", file=sys.stderr)
+        print(f"Error: {e.stderr.decode().strip()}", file=sys.stderr)
         raise
 
 def is_btrfs_subvolume(path):
@@ -210,17 +153,6 @@ def is_btrfs_subvolume(path):
     ret = subprocess.call(["btrfs", "subvolume", "show", path],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return ret == 0
-
-def check_mount_sanity():
-    if not os.path.exists(MOUNT_POINT):
-        sys.exit(f"Error: Mount point {MOUNT_POINT} does not exist.")
-    try:
-        output = subprocess.check_output(["btrfs", "subvolume", "show", MOUNT_POINT],
-                                       stderr=subprocess.STDOUT, text=True)
-        if "Subvolume ID: 5" not in output and "is the top-level subvolume" not in output:
-            print(f"WARNING: {MOUNT_POINT} is not top-level (ID 5).")
-            if input("Proceed anyway? (y/N): ").lower() != 'y': sys.exit(1)
-    except Exception: pass
 
 def check_fstab_safety():
     issues = []
@@ -235,17 +167,26 @@ def check_fstab_safety():
         for i in issues: print(f"  {i}")
         if input("Proceed anyway? (y/N): ").lower() != 'y': sys.exit(1)
 
+def btrfs_list():
+    """Parse `btrfs subvolume list /` into [(path, top_level), ...]."""
+    output = subprocess.check_output(
+        ["btrfs", "subvolume", "list", "/"], text=True)
+    results = []
+    for line in output.strip().splitlines():
+        parts = line.split()
+        # ID <id> gen <gen> top level <top> path <path>
+        top_level = parts[6]
+        path = parts[8]
+        results.append((path, top_level))
+    return results
+
 def discover_subvolumes():
-    """Find all btrfs subvolumes that are direct children of MOUNT_POINT."""
-    exclude = {CONF["snapshot_dir_name"], "old", "lost+found"}
-    subvols = []
-    for item in os.listdir(MOUNT_POINT):
-        if item in exclude or item.endswith(TEMP_SUFFIX):
-            continue
-        path = os.path.join(MOUNT_POINT, item)
-        if os.path.isdir(path) and is_btrfs_subvolume(path):
-            subvols.append(item)
-    return sorted(subvols)
+    """Find live subvolumes (top-level children, excluding bread internals)."""
+    exclude = {SNAP_DIR_NAME, "old", "lost+found"}
+    return sorted([
+        path for path, top in btrfs_list()
+        if top == "5" and "/" not in path and path not in exclude
+    ])
 
 def format_ts(ts_str):
     """Convert internal timestamp (YYYYMMDDTHHMMSS) to human-readable."""
@@ -256,16 +197,16 @@ def format_ts(ts_str):
     return ts_str
 
 def build_snapshot_table():
-    """Scan snapshot dir. Returns [(ts_str, [subvols]), ...] sorted oldest-first.
+    """Build snapshot table from btrfs subvolume list.
+    Returns [(ts_str, [subvols]), ...] sorted oldest-first.
     Position in list (1-indexed) = stable session ID."""
-    from collections import defaultdict
-    if not os.path.exists(SNAP_DIR):
-        return []
-
+    prefix = SNAP_DIR_NAME + "/"
     timestamps = defaultdict(list)
-    for fname in os.listdir(SNAP_DIR):
-        if "SAFETY" in fname or "BROKEN" in fname:
+
+    for path, top in btrfs_list():
+        if top != "5" or not path.startswith(prefix):
             continue
+        fname = path[len(prefix):]
         m = re.match(r'^(.+)\.(\d{8}T(?:\d{6}|\d{4}))$', fname)
         if not m:
             continue
@@ -279,9 +220,6 @@ def build_snapshot_table():
 
     return [(ts, sorted(subs)) for ts, subs in sorted(timestamps.items())]
 
-def validate_name(name):
-    if not re.match(r'^[a-zA-Z0-9_\-.]+$', name) or '..' in name:
-        raise ValueError(f"Invalid name '{name}'. Use alphanumeric, _, -, .")
 ```
 
 ---
@@ -292,66 +230,90 @@ def validate_name(name):
 import os
 import sys
 import json
-import copy
 import subprocess
 from bread import lib
 
-def ask(prompt, default):
-    val = input(f"{prompt} [{default}]: ").strip()
-    return val if val else default
+MOUNT_UNIT = "/etc/systemd/system/mnt-_bread.mount"
 
-def ask_int(prompt, default=None):
+def detect_boot_device():
+    """Find the btrfs device backing /."""
+    try:
+        output = subprocess.check_output(
+            ["findmnt", "-n", "-o", "SOURCE", "-t", "btrfs", "/"], text=True)
+        return output.strip()
+    except subprocess.CalledProcessError:
+        sys.exit("Error: root filesystem is not btrfs.")
+
+def ask_int(prompt):
     while True:
-        if default is not None:
-            val = input(f"{prompt} [{default}]: ").strip()
-            if not val: return default
-        else:
-            val = input(f"{prompt}: ").strip()
-            if not val:
-                print("Value required.")
-                continue
+        val = input(f"{prompt}: ").strip()
+        if not val:
+            print("Value required.")
+            continue
         if val.isdigit() and int(val) >= 0: return int(val)
         print("Non-negative integer required.")
 
+def write_mount_unit(device):
+    """Write systemd mount unit for btrfs top-level."""
+    unit = f"""[Unit]
+Description=Mount btrfs top-level for Bread
+
+[Mount]
+What={device}
+Where={lib.MOUNT_POINT}
+Type=btrfs
+Options=subvolid=5
+
+[Install]
+WantedBy=local-fs.target
+"""
+    with open(MOUNT_UNIT, 'w') as f:
+        f.write(unit)
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", "mnt-_bread.mount"], check=True)
+    print(f"Mount enabled ({lib.MOUNT_POINT}).")
+
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(prog="bread config")
+    parser.add_argument("--hourly", type=int, help="Hourly retention count")
+    parser.add_argument("--daily", type=int, help="Daily retention count")
+    parser.add_argument("--weekly", type=int, help="Weekly retention count")
+    parser.add_argument("--monthly", type=int, help="Monthly retention count")
+    args = parser.parse_args()
+
     if os.geteuid() != 0: sys.exit("Root required.")
 
-    print("--- Bread Configuration ---")
-    conf = copy.deepcopy(lib.DEFAULT_CONF)
+    device = detect_boot_device()
 
-    conf["mount_point"] = ask("Btrfs Mount Point", conf["mount_point"])
+    # Non-interactive mode (all flags provided) — used by GUI
+    if all(v is not None for v in [args.hourly, args.daily, args.weekly, args.monthly]):
+        conf = {"device": device, "retention": {
+            "hourly": args.hourly, "daily": args.daily,
+            "weekly": args.weekly, "monthly": args.monthly,
+        }}
+    else:
+        # Interactive mode
+        print("--- Bread Configuration ---\n")
+        print(f"Detected boot device: {device}")
+        print("\n[ Retention (number of snapshots to keep per period) ]")
+        conf = {"device": device, "retention": {}}
+        conf["retention"]["hourly"] = ask_int("Hourly")
+        conf["retention"]["daily"] = ask_int("Daily")
+        conf["retention"]["weekly"] = ask_int("Weekly")
+        conf["retention"]["monthly"] = ask_int("Monthly")
 
-    s_dir = ask("Snapshot Dir Name", conf["snapshot_dir_name"])
-    try:
-        lib.validate_name(s_dir)
-        conf["snapshot_dir_name"] = s_dir
-    except ValueError as e:
-        sys.exit(f"Error: {e}")
+    # Save config
+    with open(lib.CONFIG_FILE, 'w') as f:
+        json.dump(conf, f, indent=4)
+    os.chmod(lib.CONFIG_FILE, 0o644)
+    print("Configuration saved.")
 
-    print("\n[ Retention (number of snapshots to keep per period) ]")
-    conf["retention"] = {}
-    conf["retention"]["hourly"] = ask_int("Hourly")
-    conf["retention"]["daily"] = ask_int("Daily")
-    conf["retention"]["weekly"] = ask_int("Weekly")
-    conf["retention"]["monthly"] = ask_int("Monthly")
-    conf["safety_retention"] = ask_int("Safety Snapshots")
-    conf["broken_retention"] = ask_int("Broken Snapshots")
+    # Create mount unit
+    write_mount_unit(device)
 
-    if not os.path.ismount(conf["mount_point"]):
-        print(f"\n! WARNING: {conf['mount_point']} is not a mount point.")
-        if input("! Save anyway? (y/N): ").lower() != 'y': sys.exit(1)
-
-    try:
-        with open(lib.CONFIG_FILE, 'w') as f:
-            json.dump(conf, f, indent=4)
-        os.chmod(lib.CONFIG_FILE, 0o644)
-        print("Configuration saved.")
-    except Exception as e:
-        sys.exit(f"Error: {e}")
-
-    if input("\nEnable hourly snapshots? (Y/n): ").strip().lower() in ('', 'y', 'yes'):
-        subprocess.run(["systemctl", "enable", "--now", "bread-snapshot.timer"], check=False)
-        print("Timer enabled.")
+    print("\nTo enable automatic hourly snapshots:")
+    print("  systemctl enable --now bread-snapshot.timer")
 ```
 
 ---
@@ -361,62 +323,47 @@ def main():
 ```python
 import os
 import sys
+import subprocess
 import datetime
-import glob
-import argparse
+import re
 from bread import lib
 
-STATS = {'created': 0, 'pruned': 0, 'errors': 0, 'skipped': 0}
-DRY_RUN = False
+STATS = {'created': 0, 'pruned': 0, 'errors': 0}
 
 def create_snapshot(subvol_name):
     now = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     src = os.path.join(lib.MOUNT_POINT, subvol_name)
     dst = os.path.join(lib.SNAP_DIR, f"{subvol_name}.{now}")
 
-    if not os.path.exists(lib.SNAP_DIR):
-        if not DRY_RUN: os.makedirs(lib.SNAP_DIR, exist_ok=True)
+    os.makedirs(lib.SNAP_DIR, exist_ok=True)
 
     if os.path.exists(dst):
-        STATS['skipped'] += 1
         return
 
     print(f"[+] Snapshot {subvol_name} -> {os.path.basename(dst)}")
     try:
-        lib.run_cmd(["btrfs", "subvolume", "snapshot", "-r", src, dst], dry_run=DRY_RUN)
+        lib.run_cmd(["btrfs", "subvolume", "snapshot", "-r", src, dst])
         STATS['created'] += 1
     except Exception:
         STATS['errors'] += 1
 
 def get_snapshots(subvol_name):
-    pattern = os.path.join(lib.SNAP_DIR, f"{subvol_name}.[0-9]*")
+    """Get snapshots for a subvolume via btrfs subvolume list. Returns [(datetime, full_path)] newest-first."""
+    prefix = lib.SNAP_DIR_NAME + "/" + subvol_name + "."
     snaps = []
-    prefix_len = len(subvol_name) + 1
 
-    for path in glob.glob(pattern):
-        fname = os.path.basename(path)
-        if len(fname) <= prefix_len: continue
-        ts_str = fname[prefix_len:]
-
+    for path, top in lib.btrfs_list():
+        if top != "5" or not path.startswith(prefix):
+            continue
+        ts_str = path[len(prefix):]
         for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M"):
             try:
                 dt = datetime.datetime.strptime(ts_str, fmt)
-                snaps.append((dt, path))
+                snaps.append((dt, os.path.join(lib.MOUNT_POINT, path)))
                 break
             except ValueError: continue
 
     return sorted(snaps, key=lambda x: x[0], reverse=True)
-
-def prune_special_snapshots(subvol_name, suffix, retention):
-    pattern = os.path.join(lib.SNAP_DIR, f"{subvol_name}.{suffix}.*")
-    snaps = sorted(glob.glob(pattern), reverse=True)
-
-    for path in snaps[retention:]:
-        print(f"[-] Pruning {suffix}: {os.path.basename(path)}")
-        try:
-            lib.run_cmd(["btrfs", "subvolume", "delete", path], dry_run=DRY_RUN)
-            STATS['pruned'] += 1
-        except Exception: STATS['errors'] += 1
 
 def prune_snapshots(subvol_name):
     snaps = get_snapshots(subvol_name)
@@ -445,32 +392,41 @@ def prune_snapshots(subvol_name):
         if path not in keep_paths:
             print(f"[-] Pruning {os.path.basename(path)}")
             try:
-                lib.run_cmd(["btrfs", "subvolume", "delete", path], dry_run=DRY_RUN)
+                lib.run_cmd(["btrfs", "subvolume", "delete", path])
                 STATS['pruned'] += 1
             except Exception: STATS['errors'] += 1
 
-def main():
-    global DRY_RUN
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-    DRY_RUN = args.dry_run
+def timer_control(enable):
+    """Enable or disable the snapshot timer."""
+    action = "enable" if enable else "disable"
+    subprocess.run(["systemctl", action, "--now", "bread-snapshot.timer"], check=True)
+    state = "enabled" if enable else "disabled"
+    print(f"Automatic snapshots {state}.")
 
-    if os.geteuid() != 0 and not DRY_RUN: sys.exit("Root required.")
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(prog="bread snapshot")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--enable-timer", action="store_true", help="Enable automatic snapshots")
+    group.add_argument("--disable-timer", action="store_true", help="Disable automatic snapshots")
+    args = parser.parse_args()
+
+    if os.geteuid() != 0: sys.exit("Root required.")
+
+    if args.enable_timer or args.disable_timer:
+        timer_control(args.enable_timer)
+        return
+
     lib.init()
 
-    with lib.LockManager():
-        for sub in lib.discover_subvolumes():
-            try:
-                create_snapshot(sub)
-                prune_snapshots(sub)
-                prune_special_snapshots(sub, "SAFETY", lib.CONF.get("safety_retention", 3))
-                prune_special_snapshots(sub, "BROKEN", lib.CONF.get("broken_retention", 1))
-            except Exception:
-                STATS['errors'] += 1
+    for sub in lib.discover_subvolumes():
+        try:
+            create_snapshot(sub)
+            prune_snapshots(sub)
+        except Exception:
+            STATS['errors'] += 1
 
-        summary = f"Created {STATS['created']} | Pruned {STATS['pruned']} | Errors {STATS['errors']}"
-        print(f"{'[DRY RUN] ' if DRY_RUN else ''}SUMMARY: {summary}")
+    print(f"Created {STATS['created']} | Pruned {STATS['pruned']} | Errors {STATS['errors']}")
 ```
 
 ---
@@ -518,8 +474,10 @@ Rollback Plan:
   home  →  2025-06-15 12:00:00
 
 Confirm? (y/N): y
->> Phase -1: Safety Snapshots...
-...
+  root -> 2025-06-15 12:00:00
+  home -> 2025-06-15 12:00:00
+
+Done. Previous state is in old/. Reboot to apply.
 ```
 
 **Numbering:** 1 = oldest snapshot, N = newest. Ascending display (newest at bottom,
@@ -532,13 +490,8 @@ for individual selection (e.g. `2,3`).
 ```python
 import os
 import sys
-import shutil
-import argparse
 import subprocess
-from datetime import datetime
 from bread import lib
-
-DRY_RUN = False
 
 def print_table(table, show_all=False):
     """Print snapshot table. Default: last 10. show_all: everything."""
@@ -624,139 +577,64 @@ def command_loop(table):
                 print("  Unknown command. Type 'm' for help.")
 
 def execute_rollback(plan):
-    """Execute the rollback plan. Same atomic swap logic with safety phases."""
-    with lib.LockManager():
-        lib.log(f">> Rollback Plan: {plan}", dry_run=DRY_RUN)
+    """Execute the rollback plan."""
+    # Clear undo buffer
+    if os.path.exists(lib.OLD_DIR):
+        for item in os.listdir(lib.OLD_DIR):
+            lib.run_cmd(["btrfs", "subvolume", "delete", os.path.join(lib.OLD_DIR, item)])
+    else:
+        os.makedirs(lib.OLD_DIR)
 
-        # Cleanup Stale Temps
-        for item in os.listdir(lib.MOUNT_POINT):
-            if item.endswith(lib.TEMP_SUFFIX):
-                path = os.path.join(lib.MOUNT_POINT, item)
-                if lib.is_btrfs_subvolume(path):
-                    lib.run_cmd(["btrfs", "subvolume", "delete", path], check=False, dry_run=DRY_RUN)
-                else:
-                    if not DRY_RUN: shutil.rmtree(path)
+    # For each subvolume: move live to old, snapshot restore to live
+    for sub, ts in plan.items():
+        live = os.path.join(lib.MOUNT_POINT, sub)
+        old = os.path.join(lib.OLD_DIR, sub)
+        snap = os.path.join(lib.SNAP_DIR, f"{sub}.{ts}")
 
-        # Phase -1: Safety Snapshots
-        print(">> Phase -1: Safety Snapshots...")
-        now = datetime.now().strftime("%Y%m%dT%H%M%S")
-        created_safety = []
-        try:
-            for sub in plan.keys():
-                src = os.path.join(lib.MOUNT_POINT, sub)
-                dst = os.path.join(lib.SNAP_DIR, f"{sub}.SAFETY.{now}")
-                if os.path.exists(dst): continue
-                lib.run_cmd(["btrfs", "subvolume", "snapshot", "-r", src, dst], dry_run=DRY_RUN)
-                created_safety.append(dst)
-        except Exception as e:
-            lib.log(f"CRITICAL: Safety snapshot failed: {e}", console=False)
-            print("Aborting. Cleaning up partial safety snapshots...")
-            for s in created_safety:
-                lib.run_cmd(["btrfs", "subvolume", "delete", s], check=False, dry_run=DRY_RUN)
-            sys.exit(1)
+        os.rename(live, old)
+        lib.run_cmd(["btrfs", "subvolume", "snapshot", snap, live])
+        print(f"  {sub} -> {ts}")
 
-        # Phase 0: Flush Undo Buffer
-        print(">> Phase 0: Clearing Undo Buffer (old/)...")
-        if not os.path.exists(lib.OLD_DIR) and not DRY_RUN:
-            os.makedirs(lib.OLD_DIR)
-
-        if os.path.exists(lib.OLD_DIR):
-            lib.log(f"Flushing undo buffer: {os.listdir(lib.OLD_DIR)}", dry_run=DRY_RUN)
-            for item in os.listdir(lib.OLD_DIR):
-                path = os.path.join(lib.OLD_DIR, item)
-                if lib.is_btrfs_subvolume(path):
-                    lib.run_cmd(["btrfs", "subvolume", "delete", path], dry_run=DRY_RUN)
-                else:
-                    if not DRY_RUN: shutil.rmtree(path)
-
-        # Phase 1: Prepare Temps (writable snapshots from read-only originals)
-        print(">> Phase 1: Prepare Temps...")
-        temp_map = {}
-        try:
-            for sub, ts in plan.items():
-                src = os.path.join(lib.SNAP_DIR, f"{sub}.{ts}")
-                tmp = os.path.join(lib.MOUNT_POINT, f"{sub}{lib.TEMP_SUFFIX}")
-
-                if not DRY_RUN and subprocess.call(["btrfs", "subvolume", "show", src],
-                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
-                    raise Exception(f"Snapshot {src} corrupted")
-
-                lib.run_cmd(["btrfs", "subvolume", "snapshot", src, tmp], dry_run=DRY_RUN)
-                temp_map[sub] = tmp
-        except Exception as e:
-            lib.log(f"Phase 1 Error: {e}")
-            for t in temp_map.values():
-                lib.run_cmd(["btrfs", "subvolume", "delete", t], check=False, dry_run=DRY_RUN)
-            sys.exit(1)
-
-        # Phase 2: Atomic Swap (signal-shielded)
-        print(">> Phase 2: Swapping...")
-        with lib.SignalShield():
-            completed = []
-            mid_swap = False
-            order = sorted(plan.keys(), key=lambda x: 1 if x == 'root' else 0)
-
-            try:
-                for sub in order:
-                    live = os.path.join(lib.MOUNT_POINT, sub)
-                    old = os.path.join(lib.OLD_DIR, sub)
-                    temp = temp_map[sub]
-
-                    mid_swap = False
-                    if os.path.exists(live):
-                        if DRY_RUN: print(f"mv {live} -> {old}")
-                        else:
-                            os.rename(live, old)
-                            mid_swap = True
-
-                    if DRY_RUN: print(f"mv {temp} -> {live}")
-                    else:
-                        os.rename(temp, live)
-
-                    mid_swap = False
-                    completed.append(sub)
-                    lib.log(f"Swapped {sub}")
-
-            except Exception as e:
-                lib.log(f"CRITICAL SWAP FAILURE: {e}")
-                if mid_swap:
-                    try: os.rename(old, live)
-                    except: lib.log("FATAL: Could not undo mid-swap rename")
-
-                for sub in reversed(completed):
-                    l = os.path.join(lib.MOUNT_POINT, sub)
-                    o = os.path.join(lib.OLD_DIR, sub)
-                    t = temp_map[sub]
-                    try:
-                        if os.path.exists(l): os.rename(l, t)
-                        if os.path.exists(o): os.rename(o, l)
-                    except: lib.log(f"FATAL: Unwind failed for {sub}")
-                sys.exit(1)
-
-        if not DRY_RUN: subprocess.run(["sync"])
-        print("\n>> DONE. Previous state is in old/.")
-        lib.log("Rollback success")
-
-    try:
-        if not DRY_RUN and input("Reboot? [Y/n]: ").strip().lower() in ['', 'y', 'yes']:
-            subprocess.run(["reboot"])
-    except: pass
+    subprocess.run(["sync"])
+    print("\nDone. Previous state is in old/. Reboot to apply.")
 
 def main():
-    global DRY_RUN
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true")
+    import argparse
+    parser = argparse.ArgumentParser(prog="bread rollback")
+    parser.add_argument("--snapshot", type=int, help="Snapshot number (1-indexed)")
+    parser.add_argument("--subvols", type=str, help="Comma-separated subvolume names (default: all)")
+    parser.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
     args = parser.parse_args()
-    DRY_RUN = args.dry_run
 
-    if os.geteuid() != 0 and not DRY_RUN: sys.exit("Root required.")
+    if os.geteuid() != 0: sys.exit("Root required.")
     lib.init()
-    lib.check_mount_sanity()
     lib.check_fstab_safety()
 
     table = lib.build_snapshot_table()
-    plan = command_loop(table)
-    if not plan: sys.exit("Cancelled.")
+
+    # Non-interactive mode (--snapshot provided) — used by GUI
+    if args.snapshot is not None:
+        if args.snapshot < 1 or args.snapshot > len(table):
+            sys.exit(f"Invalid snapshot number. Range: 1-{len(table)}")
+        ts_str, available = table[args.snapshot - 1]
+        if args.subvols:
+            selected = [s.strip() for s in args.subvols.split(",")]
+            for s in selected:
+                if s not in available:
+                    sys.exit(f"Subvolume '{s}' not in snapshot {args.snapshot}")
+        else:
+            selected = available
+        plan = {sub: ts_str for sub in selected}
+        if not args.yes:
+            print("Rollback Plan:")
+            for sub in selected:
+                print(f"  {sub}  →  {lib.format_ts(ts_str)}")
+            if input("\nConfirm? (y/N): ").strip().lower() != "y":
+                sys.exit("Cancelled.")
+    else:
+        # Interactive mode
+        plan = command_loop(table)
+        if not plan: sys.exit("Cancelled.")
 
     execute_rollback(plan)
 ```
@@ -768,25 +646,17 @@ def main():
 ```python
 import os
 import sys
-import argparse
 import subprocess
-import shutil
-from datetime import datetime
 from bread import lib
 
-DRY_RUN = False
-
 def main():
-    global DRY_RUN
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true")
+    import argparse
+    parser = argparse.ArgumentParser(prog="bread revert")
+    parser.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
     args = parser.parse_args()
-    DRY_RUN = args.dry_run
 
-    if os.geteuid() != 0 and not DRY_RUN: sys.exit("Root required.")
+    if os.geteuid() != 0: sys.exit("Root required.")
     lib.init()
-
-    lib.check_mount_sanity()
     lib.check_fstab_safety()
 
     if not os.path.exists(lib.OLD_DIR): sys.exit("No undo buffer (old/) found.")
@@ -796,101 +666,89 @@ def main():
 
     if not to_revert: sys.exit("old/ is empty.")
 
-    print(f"Undo Targets: {', '.join(to_revert)}")
-    if input("Confirm Undo (Swap Live <-> Old)? (y/N): ").lower() != 'y': sys.exit(0)
+    if not args.yes:
+        print(f"Undo Targets: {', '.join(to_revert)}")
+        if input("Confirm? (y/N): ").lower() != 'y': sys.exit(0)
 
-    with lib.LockManager():
-        lib.log(f"Starting Undo for {to_revert}", dry_run=DRY_RUN)
+    for sub in to_revert:
+        live = os.path.join(lib.MOUNT_POINT, sub)
+        old = os.path.join(lib.OLD_DIR, sub)
+        temp = os.path.join(lib.MOUNT_POINT, f"{sub}_revert_tmp")
 
-        # Cleanup Stale Temps
-        for item in os.listdir(lib.MOUNT_POINT):
-            if item.endswith(lib.TEMP_SUFFIX):
-                path = os.path.join(lib.MOUNT_POINT, item)
-                if lib.is_btrfs_subvolume(path):
-                    lib.run_cmd(["btrfs", "subvolume", "delete", path], check=False, dry_run=DRY_RUN)
-                else:
-                    if not DRY_RUN: shutil.rmtree(path)
+        os.rename(live, temp)
+        os.rename(old, live)
+        os.rename(temp, old)
+        print(f"  Reverted {sub}")
 
-        # Phase -1: Safety Snapshot (BROKEN)
-        now = datetime.now().strftime("%Y%m%dT%H%M%S")
-        created_safety = []
-        try:
-            for sub in to_revert:
-                src = os.path.join(lib.MOUNT_POINT, sub)
-                dst = os.path.join(lib.SNAP_DIR, f"{sub}.BROKEN.{now}")
-                if os.path.exists(src):
-                    lib.run_cmd(["btrfs", "subvolume", "snapshot", "-r", src, dst], dry_run=DRY_RUN)
-                    created_safety.append(dst)
-        except Exception as e:
-            lib.log(f"Safety snapshot failed: {e}")
-            print("Cleaning up partial snapshots...")
-            for s in created_safety:
-                lib.run_cmd(["btrfs", "subvolume", "delete", s], check=False, dry_run=DRY_RUN)
-            sys.exit(1)
-
-        # Phase 2: Toggle Logic (swap live <-> old)
-        with lib.SignalShield():
-            completed = []
-            order = sorted(to_revert, key=lambda x: 1 if x == 'root' else 0)
-
-            try:
-                for sub in order:
-                    live = os.path.join(lib.MOUNT_POINT, sub)
-                    old = os.path.join(lib.OLD_DIR, sub)
-                    temp = os.path.join(lib.MOUNT_POINT, f"{sub}{lib.TEMP_SUFFIX}")
-
-                    step = 0
-                    if os.path.exists(live):
-                        if DRY_RUN: print(f"mv {live} -> {temp}")
-                        else: os.rename(live, temp)
-                        step = 1
-
-                    if DRY_RUN: print(f"mv {old} -> {live}")
-                    else: os.rename(old, live)
-                    step = 2
-
-                    if os.path.exists(temp) or DRY_RUN:
-                        if DRY_RUN: print(f"mv {temp} -> {old}")
-                        else: os.rename(temp, old)
-                        step = 3
-
-                    completed.append(sub)
-                    lib.log(f"Reverted {sub}")
-
-            except Exception as e:
-                lib.log(f"Undo Failed at step {step}: {e}")
-                print("CRITICAL ERROR. Attempting to reverse undo...")
-
-                # Mid-swap recovery for CURRENT subvolume
-                if step == 2:
-                    try: os.rename(live, old)
-                    except: lib.log("FATAL: Failed to return Old to Old")
-                    try: os.rename(temp, live)
-                    except: lib.log("FATAL: Failed to return Live to Live")
-                elif step == 1:
-                    try: os.rename(temp, live)
-                    except: lib.log("FATAL: Failed to return Live to Live")
-
-                # Reverse completed subvolumes
-                for sub in reversed(completed):
-                    l = os.path.join(lib.MOUNT_POINT, sub)
-                    o = os.path.join(lib.OLD_DIR, sub)
-                    t = os.path.join(lib.MOUNT_POINT, f"{sub}{lib.TEMP_SUFFIX}")
-                    try:
-                        if os.path.exists(l): os.rename(l, t)
-                        if os.path.exists(o): os.rename(o, l)
-                        if os.path.exists(t): os.rename(t, o)
-                    except:
-                        lib.log(f"FATAL: Recovery failed for {sub}")
-                sys.exit(1)
-
-        if not DRY_RUN: subprocess.run(["sync"])
-        print("Undo Complete. Previous state is back in old/.")
+    subprocess.run(["sync"])
+    print("Done. Reboot to apply.")
 ```
 
 ---
 
-### 9. GUI: Application (`bread/gui/`)
+### 9. CLI: Purge (`bread/cli/purge.py`)
+
+Removes all bread data so `dnf remove bread` leaves no trace.
+
+```python
+import os
+import sys
+import subprocess
+from bread import lib
+
+MOUNT_UNIT = "/etc/systemd/system/mnt-_bread.mount"
+
+def delete_subvolumes_in(directory):
+    """Delete all btrfs subvolumes inside a directory."""
+    if not os.path.exists(directory):
+        return
+    for item in os.listdir(directory):
+        path = os.path.join(directory, item)
+        if lib.is_btrfs_subvolume(path):
+            lib.run_cmd(["btrfs", "subvolume", "delete", path])
+            print(f"  Deleted {path}")
+
+def main():
+    if os.geteuid() != 0: sys.exit("Root required.")
+
+    print("This will remove ALL bread snapshots, config, and systemd units.")
+    if input("Continue? (y/N): ").lower() != 'y': sys.exit(0)
+
+    # Disable timer
+    subprocess.run(["systemctl", "disable", "--now", "bread-snapshot.timer"], check=False)
+    print("Timer disabled.")
+
+    # Delete all snapshots
+    delete_subvolumes_in(lib.SNAP_DIR)
+    if os.path.exists(lib.SNAP_DIR):
+        os.rmdir(lib.SNAP_DIR)
+
+    # Delete undo buffer
+    delete_subvolumes_in(lib.OLD_DIR)
+    if os.path.exists(lib.OLD_DIR):
+        os.rmdir(lib.OLD_DIR)
+
+    # Unmount and remove mount unit
+    subprocess.run(["systemctl", "disable", "--now", "mnt-_bread.mount"], check=False)
+    if os.path.exists(MOUNT_UNIT):
+        os.remove(MOUNT_UNIT)
+        subprocess.run(["systemctl", "daemon-reload"], check=False)
+    if os.path.exists(lib.MOUNT_POINT):
+        os.rmdir(lib.MOUNT_POINT)
+    print("Mount removed.")
+
+    # Remove config
+    if os.path.exists(lib.CONFIG_FILE):
+        os.remove(lib.CONFIG_FILE)
+    print("Config removed.")
+
+    print("\nPurge complete. Run 'dnf remove bread' to finish uninstall.")
+```
+
+---
+
+### 10. GUI: Application (`bread/gui/`)
+
 
 GTK application. Runs unprivileged for browsing, elevates via pkexec for
 privileged operations.
@@ -901,19 +759,16 @@ privileged operations.
 ┌─────────────────────────────────────────┐
 │  Bread - Setup                          │
 │                                         │
-│  Btrfs Mount Point:  [/mnt/btrfs_pool]  │
-│  Snapshot Dir Name:  [_btrbk_snap    ]  │
-│                                         │
 │  Retention                              │
-│  Hourly:   [48]    Daily:   [14]        │
-│  Weekly:   [ 4]    Monthly: [ 6]        │
-│  Safety:   [ 3]    Broken:  [ 1]        │
+│  Hourly:   [  ]    Daily:   [  ]        │
+│  Weekly:   [  ]    Monthly: [  ]        │
 │                                         │
 │              [Cancel]  [Save]           │
 └─────────────────────────────────────────┘
 ```
 
-Save calls `pkexec` to write `/etc/bread.json` (needs root). On success,
+Save calls `pkexec bread config --hourly N --daily N --weekly N --monthly N`
+(auto-detects boot device, writes config, creates mount unit). On success,
 transitions to the main window.
 
 **Main window:**
@@ -932,7 +787,7 @@ transitions to the main window.
 │  199  2025-06-15 13:00:00   root, home               │ █ │
 │▸ 200  2025-06-15 14:00:00   root, home               │ ▼ │
 │─────────────────────────────────────────────────────────│
-│  [Rollback]                              [Revert Undo]  │
+│  [Snapshots: On]  [Rollback]             [Revert Undo]  │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -940,6 +795,7 @@ transitions to the main window.
 - Select a row, click Rollback to begin
 - Refresh button to rescan the snapshot directory
 - Config button reopens the setup dialog
+- Snapshots toggle checks timer state (`systemctl is-enabled bread-snapshot.timer`), calls `pkexec bread snapshot --enable-timer` or `--disable-timer` on click
 
 **Rollback confirmation dialog:**
 
@@ -959,17 +815,17 @@ transitions to the main window.
 - All checkboxes checked by default
 - "All (Recommended)" toggles all others
 - Unchecking a subvolume unchecks "All (Recommended)"
-- Clicking Rollback calls `pkexec bread rollback ...` (elevated)
+- Clicking Rollback calls `pkexec bread rollback --snapshot N --subvols root,home --yes`
 - On success: dialog with "Rollback complete. Reboot now?" [Later] [Reboot]
 - On error: dialog showing the error message
 
 **Revert button:**
 
 - Shows confirmation: "Undo last rollback? Targets: root, home"
-- Calls `pkexec bread revert` on confirm
+- Calls `pkexec bread revert --yes` on confirm
 - Same success/error handling as rollback
 
-**GUI entry point (`/usr/local/bin/bread-gui`):**
+**GUI entry point (`/usr/bin/bread-gui`):**
 
 ```python
 #!/usr/bin/env python3
@@ -980,7 +836,7 @@ BreadApp().run(sys.argv)
 
 ---
 
-### 10. Polkit Policy (`/usr/share/polkit-1/actions/org.bread.policy`)
+### 11. Polkit Policy (`/usr/share/polkit-1/actions/org.bread.policy`)
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -988,7 +844,7 @@ BreadApp().run(sys.argv)
  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
-  <vendor>Bread Suite</vendor>
+  <vendor>Bread</vendor>
   <vendor_url>https://github.com/user/bread</vendor_url>
 
   <action id="org.bread.manage-snapshots">
@@ -1007,7 +863,7 @@ BreadApp().run(sys.argv)
 
 ---
 
-### 11. Desktop File (`/usr/share/applications/bread.desktop`)
+### 12. Desktop File (`/usr/share/applications/bread.desktop`)
 
 ```ini
 [Desktop Entry]
@@ -1022,7 +878,7 @@ Categories=System;
 
 ---
 
-### 12. RPM Spec (`bread.spec`)
+### 13. RPM Spec (`bread.spec`)
 
 ```spec
 Name:           bread
@@ -1075,7 +931,7 @@ systemctl daemon-reload 2>/dev/null || :
 %systemd_preun bread-snapshot.timer bread-snapshot.service
 
 %postun
-%systemd_postun_with_restart bread-snapshot.timer
+%systemd_postun bread-snapshot.timer
 
 %files
 %{_bindir}/bread
@@ -1089,13 +945,15 @@ systemctl daemon-reload 2>/dev/null || :
 
 ---
 
-### 13. Systemd Units
+### 14. Systemd Units
 
 **`/etc/systemd/system/bread-snapshot.service`**
 
 ```ini
 [Unit]
 Description=Run Bread snapshot engine
+Requires=mnt-_bread.mount
+After=mnt-_bread.mount
 
 [Service]
 Type=oneshot
