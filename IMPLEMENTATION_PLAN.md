@@ -38,9 +38,11 @@ Config: `/etc/bread.json`
 │   │   └── org.bread.policy             # Privilege elevation policy
 │   └── applications/
 │       └── bread.desktop                # Desktop launcher
+/usr/lib/systemd/system/
+├── bread-snapshot.service              # RPM-packaged
+└── bread-snapshot.timer                # RPM-packaged
 /etc/systemd/system/
-├── bread-snapshot.service
-└── bread-snapshot.timer
+└── mnt-_bread.mount                    # Created by bread config at runtime
 ```
 
 ---
@@ -70,10 +72,19 @@ buffer). The systemd timer handles scheduled snapshot creation.
 
 ---
 
-### 3. Dispatcher (`/usr/bin/bread`)
+### 3. Dispatcher
+
+**Entry point (`/usr/bin/bread`):**
 
 ```python
 #!/usr/bin/env python3
+from bread.cli.main import main
+main()
+```
+
+**Dispatcher (`bread/cli/main.py`):**
+
+```python
 import sys
 import argparse
 import importlib
@@ -101,9 +112,6 @@ def main():
     sys.argv = [args.command] + args.args
     mod = importlib.import_module(f"bread.cli.{args.command}")
     mod.main()
-
-if __name__ == "__main__":
-    main()
 ```
 
 ---
@@ -156,7 +164,7 @@ def is_btrfs_subvolume(path):
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return ret == 0
 
-def check_fstab_safety():
+def check_fstab_safety(interactive=True):
     issues = []
     try:
         with open("/etc/fstab", "r") as f:
@@ -167,6 +175,8 @@ def check_fstab_safety():
     if issues:
         print("!!! DANGER: FSTAB USES SUBVOLID !!! (Boot will fail after rollback)")
         for i in issues: print(f"  {i}")
+        if not interactive:
+            sys.exit("Refusing to proceed non-interactively. Fix fstab first.")
         if input("Proceed anyway? (y/N): ").lower() != 'y': sys.exit(1)
 
 def btrfs_list():
@@ -610,7 +620,7 @@ def main():
 
     if os.geteuid() != 0: sys.exit("Root required.")
     lib.init()
-    lib.check_fstab_safety()
+    lib.check_fstab_safety(interactive=not args.yes)
 
     table = lib.build_snapshot_table()
 
@@ -659,7 +669,7 @@ def main():
 
     if os.geteuid() != 0: sys.exit("Root required.")
     lib.init()
-    lib.check_fstab_safety()
+    lib.check_fstab_safety(interactive=not args.yes)
 
     if not os.path.exists(lib.OLD_DIR): sys.exit("No undo buffer (old/) found.")
 
@@ -896,6 +906,7 @@ URL:            https://github.com/user/bread
 Source0:        %{name}-%{version}.tar.gz
 
 Requires:       python3
+Requires:       python3-gobject
 Requires:       btrfs-progs
 Requires:       libadwaita
 Requires:       gtk4
@@ -953,7 +964,7 @@ systemctl daemon-reload 2>/dev/null || :
 
 ### 14. Systemd Units
 
-**`/etc/systemd/system/bread-snapshot.service`**
+**`/usr/lib/systemd/system/bread-snapshot.service`**
 
 ```ini
 [Unit]
@@ -969,7 +980,7 @@ IOSchedulingClass=idle
 IOSchedulingPriority=7
 ```
 
-**`/etc/systemd/system/bread-snapshot.timer`**
+**`/usr/lib/systemd/system/bread-snapshot.timer`**
 
 ```ini
 [Unit]
