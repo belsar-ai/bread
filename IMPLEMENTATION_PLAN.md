@@ -209,16 +209,15 @@ def format_ts(ts_str):
     return ts_str
 
 def build_snapshot_table():
-    """Build snapshot table from btrfs subvolume list.
+    """Build snapshot table from snapshot directory listing.
     Returns [(ts_str, [subvols]), ...] sorted oldest-first.
-    Position in list (1-indexed) = stable session ID."""
-    prefix = SNAP_DIR_NAME + "/"
+    Position in list (1-indexed) = stable session ID.
+    Uses os.listdir (no root required) so CLI and GUI share one code path."""
+    if not os.path.exists(SNAP_DIR):
+        return []
     timestamps = defaultdict(list)
 
-    for path, top in btrfs_list():
-        if top != "5" or not path.startswith(prefix):
-            continue
-        fname = path[len(prefix):]
+    for fname in os.listdir(SNAP_DIR):
         m = re.match(r'^(.+)\.(\d{8}T(?:\d{6}|\d{4}))$', fname)
         if not m:
             continue
@@ -337,7 +336,6 @@ import os
 import sys
 import subprocess
 import datetime
-import re
 from bread import lib
 
 STATS = {'created': 0, 'pruned': 0, 'errors': 0}
@@ -360,18 +358,20 @@ def create_snapshot(subvol_name):
         STATS['errors'] += 1
 
 def get_snapshots(subvol_name):
-    """Get snapshots for a subvolume via btrfs subvolume list. Returns [(datetime, full_path)] newest-first."""
-    prefix = lib.SNAP_DIR_NAME + "/" + subvol_name + "."
+    """Get snapshots for a subvolume from directory listing. Returns [(datetime, full_path)] newest-first."""
+    if not os.path.exists(lib.SNAP_DIR):
+        return []
+    prefix = subvol_name + "."
     snaps = []
 
-    for path, top in lib.btrfs_list():
-        if top != "5" or not path.startswith(prefix):
+    for fname in os.listdir(lib.SNAP_DIR):
+        if not fname.startswith(prefix):
             continue
-        ts_str = path[len(prefix):]
+        ts_str = fname[len(prefix):]
         for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M"):
             try:
                 dt = datetime.datetime.strptime(ts_str, fmt)
-                snaps.append((dt, os.path.join(lib.MOUNT_POINT, path)))
+                snaps.append((dt, os.path.join(lib.SNAP_DIR, fname)))
                 break
             except ValueError: continue
 
@@ -763,7 +763,9 @@ def main():
 
 GTK4 + libadwaita application. Runs unprivileged for browsing, elevates via
 pkexec for privileged operations. Uses `Adw.ApplicationWindow` and
-`Adw.HeaderBar` for native GNOME styling.
+`Adw.HeaderBar` for native GNOME styling. Snapshot table uses
+`lib.build_snapshot_table()` (directory listing, no root needed) — same
+code path as the CLI, so snapshot numbering is always consistent.
 
 **First launch (no config):**
 
