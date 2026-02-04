@@ -59,9 +59,11 @@ print output. The CLI is the complete implementation.
 
 **GUI** (`bread/gui/`):
 
-GTK application. Reads the filesystem directly for display (snapshot table, config).
-For privileged operations (rollback, revert, config save), calls `pkexec bread <subcommand>`.
-The GUI never reimplements btrfs logic -- it delegates to the CLI.
+GTK4 + libadwaita application. Uses `Adw.Application`, `Adw.ApplicationWindow`,
+`Adw.HeaderBar` for native GNOME look. Reads the filesystem directly for display
+(snapshot table, config). For privileged operations (rollback, revert, config save),
+calls `pkexec bread <subcommand>`. The GUI never reimplements btrfs logic -- it
+delegates to the CLI.
 
 No daemon. State lives on the filesystem (config file, snapshot directory, undo
 buffer). The systemd timer handles scheduled snapshot creation.
@@ -749,9 +751,9 @@ def main():
 
 ### 10. GUI: Application (`bread/gui/`)
 
-
-GTK application. Runs unprivileged for browsing, elevates via pkexec for
-privileged operations.
+GTK4 + libadwaita application. Runs unprivileged for browsing, elevates via
+pkexec for privileged operations. Uses `Adw.ApplicationWindow` and
+`Adw.HeaderBar` for native GNOME styling.
 
 **First launch (no config):**
 
@@ -829,6 +831,9 @@ transitions to the main window.
 
 ```python
 #!/usr/bin/env python3
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
 import sys
 from bread.gui.app import BreadApp
 BreadApp().run(sys.argv)
@@ -892,6 +897,7 @@ Source0:        %{name}-%{version}.tar.gz
 
 Requires:       python3
 Requires:       btrfs-progs
+Requires:       libadwaita
 Requires:       gtk4
 Requires:       polkit
 
