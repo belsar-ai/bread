@@ -4,7 +4,7 @@ Release:        1%{?dist}
 Summary:        Btrfs snapshot manager with CLI and GUI
 
 License:        Apache-2.0
-URL:            https://github.com/user/bread
+URL:            https://github.com/belsar-ai/bread
 Source0:        %{name}-%{version}.tar.gz
 
 BuildArch:      noarch
@@ -23,6 +23,9 @@ Bread is a Btrfs snapshot manager. It provides automatic hourly snapshots
 with configurable retention, interactive rollback (CLI and GTK GUI), and
 one-level undo. The CLI uses an fdisk-style command loop. The GUI elevates
 via pkexec for privileged operations.
+
+%prep
+%autosetup
 
 %generate_buildrequires
 %pyproject_buildrequires

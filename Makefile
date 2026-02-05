@@ -1,4 +1,4 @@
-.PHONY: install lint clean release
+.PHONY: install lint clean release rpm
 
 install:
 	uv sync
@@ -11,7 +11,10 @@ clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +
 	find . -type f -name "*.pyc" -delete
 	find . -type d -name "*.egg-info" -exec rm -rf {} +
-	rm -rf dist/ build/
+	rm -rf dist/ build/ rpmbuild/
+
+rpm:
+	./scripts/build-rpm.sh
 
 # Release management
 _check_version:
