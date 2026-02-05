@@ -1,0 +1,40 @@
+---
+specfile_path: bread.spec
+upstream_package_name: bread
+downstream_package_name: bread
+upstream_project_url: https://github.com/belsar-ai/bread
+upstream_tag_template: v{version}
+
+actions:
+  create-archive:
+    - sh -c "VERSION=$(python3 -c \"import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])\") && git archive --format=tar.gz --prefix=bread-$VERSION/ -o bread-$VERSION.tar.gz HEAD && echo bread-$VERSION.tar.gz"
+  get-current-version:
+    - python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+
+jobs:
+  - job: copr_build
+    trigger: pull_request
+    targets:
+      - fedora-stable
+      - fedora-development
+
+  - job: copr_build
+    trigger: commit
+    branch: main
+    owner: belsar
+    project: bread
+    targets:
+      - fedora-stable
+      - fedora-development
+    list_on_homepage: true
+    preserve_project: true
+
+  - job: copr_build
+    trigger: release
+    owner: belsar
+    project: bread
+    targets:
+      - fedora-stable
+      - fedora-development
+    list_on_homepage: true
+    preserve_project: true

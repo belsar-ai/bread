@@ -55,27 +55,30 @@ This runs `scripts/build-rpm.sh`, which creates:
 - `rpmbuild/RPMS/noarch/bread-X.Y.Z-1.*.noarch.rpm`
 - `rpmbuild/SRPMS/bread-X.Y.Z-1.*.src.rpm`
 
-## COPR Distribution
+## COPR Distribution (via Packit)
 
-The bread RPM is distributed via [Fedora COPR](https://copr.fedorainfracloud.org/).
+COPR builds are automated by [Packit](https://packit.dev/). Configuration lives in `.packit.yaml`.
 
-### Setup (one-time, via COPR web UI)
+### How it works
 
-1. Sign in at https://copr.fedorainfracloud.org/ with your FAS account
-2. Create a new project (e.g., `bread`)
-3. Under **Packages**, add a package:
-   - **Source Type**: SCM
-   - **Clone URL**: `https://github.com/belsar-ai/bread.git`
-   - **Spec file path**: `bread.spec`
-   - **SCM Type**: git
-   - **Method**: rpkg
-4. Under **Settings**, enable the Fedora versions you want to build for
-5. Optionally enable auto-rebuild via the webhook URL provided by COPR
+- **Pull requests**: Packit builds the RPM in a temporary COPR project and reports the result as a GitHub status check.
+- **Commits to `main`**: Packit builds into the `belsar/bread` COPR project.
+- **GitHub releases**: Packit builds a release RPM into `belsar/bread`.
+
+### Setup (one-time)
+
+1. Install the [Packit GitHub App](https://github.com/marketplace/packit-as-a-service) on the repository
+2. Ensure your [FAS account](https://accounts.fedoraproject.org/) has your GitHub username populated
+3. Grant Packit build permissions on the COPR project:
+   ```bash
+   copr-cli edit-permissions --builder packit belsar/bread
+   ```
+4. In the COPR project settings, add `github.com/belsar-ai/bread` to **Packit allowed forge projects**
 
 ### Installing from COPR
 
 ```bash
-sudo dnf copr enable belsar-ai/bread
+sudo dnf copr enable belsar/bread
 sudo dnf install bread
 ```
 

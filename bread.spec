@@ -65,3 +65,7 @@ systemctl daemon-reload 2>/dev/null || :
 %{_unitdir}/bread-snapshot.timer
 %{_datadir}/polkit-1/actions/org.bread.policy
 %{_datadir}/applications/bread.desktop
+
+%changelog
+* Thu Jun 26 2025 Belsar <belsar@users.noreply.github.com> - 0.1.0-1
+- Initial package
