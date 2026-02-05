@@ -124,6 +124,8 @@ def build_snapshot_table():
     timestamps = defaultdict(list)
 
     for fname in os.listdir(SNAP_DIR):
+        if fname.startswith("."):
+            continue
         m = re.match(r"^(.+)\.(\d{8}T(?:\d{6}|\d{4}))$", fname)
         if not m:
             continue
