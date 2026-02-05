@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Bread
+Comment=Btrfs snapshot manager
+Exec=bread-gui
+Icon=drive-harddisk
+Terminal=false
+Type=Application
+Categories=System;

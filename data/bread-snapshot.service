@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Bread snapshot engine
+Requires=mnt-_bread.mount
+After=mnt-_bread.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bread snapshot
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
