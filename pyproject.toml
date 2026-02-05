@@ -1,0 +1,27 @@
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+[project]
+name = "bread"
+version = "0.1.0"
+description = "Btrfs snapshot manager"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.5.0",
+]
+
+[project.scripts]
+bread = "bread.cli.main:main"
+
+[project.gui-scripts]
+bread-gui = "bread.gui.app:main"
+
+[tool.ruff.lint.per-file-ignores]
+"src/bread/gui/app.py" = ["E402"]
+
+[tool.uv.build-backend]
+module-name = "bread"
