@@ -2,19 +2,7 @@ import os
 import sys
 import subprocess
 from bread import lib
-
-
-def print_table(table, show_all=False):
-    """Print snapshot table. Default: last 10. show_all: everything."""
-    if not table:
-        print("  No snapshots found.")
-        return
-    start = 0 if show_all else max(0, len(table) - 10)
-    print(f"\n  {'#':>4}  {'Timestamp':<21}  Subvolumes")
-    for i in range(start, len(table)):
-        num = i + 1
-        ts_str, subvols = table[i]
-        print(f"  {num:>4}  {lib.format_ts(ts_str):<21}  {', '.join(subvols)}")
+from bread.cli.list import print_table
 
 
 def select_subvolumes(available):
