@@ -1,5 +1,5 @@
 Name:           bread
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Btrfs snapshot manager with CLI and GUI
 
