@@ -11,6 +11,7 @@ BuildArch:      noarch
 BuildRequires:  python3-devel
 BuildRequires:  python3-uv-build
 BuildRequires:  pyproject-rpm-macros
+BuildRequires:  systemd-rpm-macros
 
 Requires:       python3-gobject
 Requires:       btrfs-progs
