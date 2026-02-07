@@ -99,7 +99,8 @@ def main():
 
     print("\nRollback Plan:")
     for sub in selected:
-        print(f"  {sub}  \u2192  {lib.format_ts(ts_str)}")
+        date, time = lib.format_ts(ts_str)
+        print(f"  {sub}  \u2192  {date} {time}")
 
     if not args.yes:
         if input("\nConfirm? (y/N): ").strip().lower() != "y":

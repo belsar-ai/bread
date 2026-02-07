@@ -79,7 +79,9 @@ class BreadWindow(Adw.ApplicationWindow):
 
         for i, (ts_str, subvols) in enumerate(self.table):
             self.listbox.append(
-                self._make_row(str(i + 1), lib.format_ts(ts_str), ", ".join(subvols))
+                self._make_row(
+                    str(i + 1), " ".join(lib.format_ts(ts_str)), ", ".join(subvols)
+                )
             )
 
         GLib.idle_add(self._scroll_to_bottom)
@@ -234,7 +236,7 @@ class RollbackDialog(Adw.MessageDialog):
     def __init__(self, parent, num, ts_str, subvols):
         super().__init__(
             transient_for=parent,
-            heading=f"Rollback to {lib.format_ts(ts_str)}",
+            heading=f"Rollback to {' '.join(lib.format_ts(ts_str))}",
             body="Select subvolumes:",
         )
 

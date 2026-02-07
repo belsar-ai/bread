@@ -102,16 +102,14 @@ def discover_subvolumes():
 
 
 def format_ts(ts_str):
-    """Convert internal timestamp (YYYYMMDDTHHMMSS) to human-readable."""
-    for fmt_in, fmt_out in [
-        ("%Y%m%dT%H%M%S", "%Y-%m-%d %H:%M:%S"),
-        ("%Y%m%dT%H%M", "%Y-%m-%d %H:%M"),
-    ]:
+    """Convert internal timestamp (YYYYMMDDTHHMMSS) to (date, time) tuple."""
+    for fmt_in in ["%Y%m%dT%H%M%S", "%Y%m%dT%H%M"]:
         try:
-            return datetime.strptime(ts_str, fmt_in).strftime(fmt_out)
+            dt = datetime.strptime(ts_str, fmt_in)
+            return dt.strftime("%b %d"), dt.strftime("%-I:%M %p")
         except ValueError:
             continue
-    return ts_str
+    return ts_str, ""
 
 
 def build_snapshot_table():

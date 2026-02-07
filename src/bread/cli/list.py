@@ -8,10 +8,11 @@ def format_table(table):
     """Format snapshot table as string."""
     if not table:
         return "  No snapshots found.\n"
-    lines = [f"  {'#':>4}  {'Timestamp':<21}  Subvolumes"]
+    lines = [f"  {'#':>4}  {'Date':<8}  {'Time':<9}  Subvolumes"]
     for i, (ts_str, subvols) in enumerate(table):
         num = i + 1
-        lines.append(f"  {num:>4}  {lib.format_ts(ts_str):<21}  {', '.join(subvols)}")
+        date, time = lib.format_ts(ts_str)
+        lines.append(f"  {num:>4}  {date:<8}  {time:<9}  {', '.join(subvols)}")
     return "\n".join(lines) + "\n"
 
 
@@ -22,10 +23,11 @@ def print_recent(table, count=10):
         return
     start = max(0, len(table) - count)
     recent = table[start:]
-    print(f"  {'#':>4}  {'Timestamp':<21}  Subvolumes")
+    print(f"  {'#':>4}  {'Date':<8}  {'Time':<9}  Subvolumes")
     for i, (ts_str, subvols) in enumerate(recent, start=start):
         num = i + 1
-        print(f"  {num:>4}  {lib.format_ts(ts_str):<21}  {', '.join(subvols)}")
+        date, time = lib.format_ts(ts_str)
+        print(f"  {num:>4}  {date:<8}  {time:<9}  {', '.join(subvols)}")
 
 
 def main():
