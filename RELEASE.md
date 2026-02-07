@@ -62,7 +62,6 @@ COPR builds are automated by [Packit](https://packit.dev/). Configuration lives 
 ### How it works
 
 - **Pull requests**: Packit builds the RPM in a temporary COPR project and reports the result as a GitHub status check.
-- **Commits to `main`**: Packit builds into the `belsar/bread` COPR project.
 - **GitHub releases**: Packit builds a release RPM into `belsar/bread`.
 
 ### Setup (one-time)

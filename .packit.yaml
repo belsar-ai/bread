@@ -19,17 +19,6 @@ jobs:
       - fedora-development
 
   - job: copr_build
-    trigger: commit
-    branch: main
-    owner: belsar
-    project: bread
-    targets:
-      - fedora-stable
-      - fedora-development
-    list_on_homepage: true
-    preserve_project: true
-
-  - job: copr_build
     trigger: release
     owner: belsar
     project: bread

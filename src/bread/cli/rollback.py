@@ -4,19 +4,6 @@ import subprocess
 from bread import lib
 
 
-def print_table(table, show_all=False):
-    """Print snapshot table. Default: last 10. show_all: everything."""
-    if not table:
-        print("  No snapshots found.")
-        return
-    start = 0 if show_all else max(0, len(table) - 10)
-    print(f"\n  {'#':>4}  {'Timestamp':<21}  Subvolumes")
-    for i in range(start, len(table)):
-        num = i + 1
-        ts_str, subvols = table[i]
-        print(f"  {num:>4}  {lib.format_ts(ts_str):<21}  {', '.join(subvols)}")
-
-
 def select_subvolumes(available):
     """Prompt for subvolume selection. Enter = All. Supports comma-separated."""
     print("\nRoll back which subvolumes?")
@@ -41,53 +28,6 @@ def select_subvolumes(available):
         except ValueError:
             pass
         print("  Invalid selection.")
-
-
-def command_loop(table):
-    """fdisk-style command loop. Returns plan dict {subvol: ts_str} or None."""
-    print("\nBread Rollback")
-    print("\u2500" * 50)
-    print_table(table)
-
-    while True:
-        try:
-            cmd = input("\nCommand (m for help): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return None
-
-        if not cmd:
-            continue
-        elif cmd == "q":
-            return None
-        elif cmd == "m":
-            print("\n  Commands:")
-            print("  #     Select snapshot by number")
-            print("  l     List all snapshots")
-            print("  m     Show this help")
-            print("  q     Quit")
-        elif cmd == "l":
-            print_table(table, show_all=True)
-        else:
-            try:
-                num = int(cmd)
-                if 1 <= num <= len(table):
-                    ts_str, subvols = table[num - 1]
-                    print(f"\nSelected: {lib.format_ts(ts_str)}")
-                    selected = select_subvolumes(subvols)
-
-                    print("\nRollback Plan:")
-                    for sub in selected:
-                        print(f"  {sub}  \u2192  {lib.format_ts(ts_str)}")
-
-                    confirm = input("\nConfirm? (y/N): ").strip().lower()
-                    if confirm == "y":
-                        return {sub: ts_str for sub in selected}
-                    print("Cancelled.")
-                else:
-                    print(f"  Invalid number. Range: 1-{len(table)}")
-            except ValueError:
-                print("  Unknown command. Type 'm' for help.")
 
 
 def execute_rollback(plan, ts_str):
@@ -129,11 +69,11 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(prog="bread rollback")
-    parser.add_argument("--snapshot", type=int, help="Snapshot number (1-indexed)")
+    parser.add_argument("snapshot", type=int, help="Snapshot number (from bread list)")
     parser.add_argument(
         "--subvols", type=str, help="Comma-separated subvolume names (default: all)"
     )
-    parser.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
@@ -142,31 +82,27 @@ def main():
     lib.check_fstab_safety(interactive=not args.yes)
 
     table = lib.build_snapshot_table()
+    if args.snapshot < 1 or args.snapshot > len(table):
+        sys.exit(f"Invalid snapshot number. Range: 1-{len(table)}")
 
-    # Non-interactive mode (--snapshot provided) — used by GUI
-    if args.snapshot is not None:
-        if args.snapshot < 1 or args.snapshot > len(table):
-            sys.exit(f"Invalid snapshot number. Range: 1-{len(table)}")
-        ts_str, available = table[args.snapshot - 1]
-        if args.subvols:
-            selected = [s.strip() for s in args.subvols.split(",")]
-            for s in selected:
-                if s not in available:
-                    sys.exit(f"Subvolume '{s}' not in snapshot {args.snapshot}")
-        else:
-            selected = available
-        plan = {sub: ts_str for sub in selected}
-        if not args.yes:
-            print("Rollback Plan:")
-            for sub in selected:
-                print(f"  {sub}  \u2192  {lib.format_ts(ts_str)}")
-            if input("\nConfirm? (y/N): ").strip().lower() != "y":
-                sys.exit("Cancelled.")
+    ts_str, available = table[args.snapshot - 1]
+
+    if args.subvols:
+        selected = [s.strip() for s in args.subvols.split(",")]
+        for s in selected:
+            if s not in available:
+                sys.exit(f"Subvolume '{s}' not in snapshot {args.snapshot}")
     else:
-        # Interactive mode
-        plan = command_loop(table)
-        if not plan:
+        selected = select_subvolumes(available)
+
+    plan = {sub: ts_str for sub in selected}
+
+    print("\nRollback Plan:")
+    for sub in selected:
+        print(f"  {sub}  \u2192  {lib.format_ts(ts_str)}")
+
+    if not args.yes:
+        if input("\nConfirm? (y/N): ").strip().lower() != "y":
             sys.exit("Cancelled.")
-        ts_str = next(iter(plan.values()))  # All entries share same timestamp
 
     execute_rollback(plan, ts_str)
