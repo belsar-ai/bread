@@ -50,7 +50,7 @@ COPR builds are automated by [Packit](https://packit.dev/). Configuration lives 
 2. Ensure your [FAS account](https://accounts.fedoraproject.org/) has your GitHub username populated
 3. Grant Packit build permissions on the COPR project:
    ```bash
-   copr-cli edit-permissions --builder packit belsar/bread
+   copr-cli edit-permissions --admin packit belsar/bread
    ```
 4. In the COPR project settings, add `github.com/belsar-ai/bread` to **Packit allowed forge projects**
 
