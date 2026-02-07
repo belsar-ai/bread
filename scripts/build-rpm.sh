@@ -28,7 +28,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_DIR"
 
 # Build SRPM via Packit (same path as CI)
-PACKIT_OUTPUT=$(packit srpm 2>&1)
+PACKIT_OUTPUT=$(packit srpm --preserve-spec 2>&1)
 echo "$PACKIT_OUTPUT"
 SRPM=$(echo "$PACKIT_OUTPUT" | grep -oP '(?<=SRPM: ).*')
 

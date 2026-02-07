@@ -73,7 +73,7 @@ class BreadWindow(Adw.ApplicationWindow):
             self.listbox.remove(row)
 
         # Header row
-        hdr = self._make_row("#", "Timestamp", "Subvolumes", bold=True)
+        hdr = self._make_row("#", "Date / Time", "Subvolumes", bold=True)
         hdr.set_selectable(False)
         self.listbox.append(hdr)
 
