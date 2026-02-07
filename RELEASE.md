@@ -22,27 +22,11 @@ Follow **Conventional Commits**:
 make release VERSION=X.Y.Z
 ```
 
-This bumps the version in `pyproject.toml` and `bread.spec`, commits, and creates an annotated git tag. Push manually when ready:
+This bumps the version in `pyproject.toml` and `bread.spec`, commits, and creates an annotated git tag. Push and create a GitHub Release to trigger the Packit COPR build:
 
 ```bash
 git push && git push origin vX.Y.Z
-```
-
-## CI/CD (GitHub Actions)
-
-When you push a version tag (`v*`), the GitHub Actions workflow automatically:
-
-1. Builds the RPM in a Fedora container
-2. Creates a GitHub Release with the RPM and SRPM attached
-
-The workflow is defined in `.github/workflows/release.yml`.
-
-### Full release flow
-
-```bash
-make release VERSION=X.Y.Z
-git push && git push origin vX.Y.Z
-# GitHub Actions takes over from here
+gh release create vX.Y.Z --generate-notes
 ```
 
 ### Local RPM build (for testing)
@@ -50,10 +34,6 @@ git push && git push origin vX.Y.Z
 ```bash
 make rpm
 ```
-
-This runs `scripts/build-rpm.sh`, which creates:
-- `rpmbuild/RPMS/noarch/bread-X.Y.Z-1.*.noarch.rpm`
-- `rpmbuild/SRPMS/bread-X.Y.Z-1.*.src.rpm`
 
 ## COPR Distribution (via Packit)
 
