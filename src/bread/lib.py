@@ -114,12 +114,12 @@ def format_ts(ts_str):
 
 def build_snapshot_table():
     """Build snapshot table from snapshot directory listing.
-    Returns [(ts_str, [subvols]), ...] sorted oldest-first.
+    Returns [(display_ts, {subvol: actual_ts}), ...] sorted oldest-first.
     Position in list (1-indexed) = stable session ID.
     Uses os.listdir (no root required) so CLI and GUI share one code path."""
     if not os.path.exists(SNAP_DIR):
         return []
-    timestamps = defaultdict(list)
+    groups = defaultdict(dict)
 
     for fname in os.listdir(SNAP_DIR):
         if fname.startswith("."):
@@ -131,12 +131,23 @@ def build_snapshot_table():
         for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M"):
             try:
                 datetime.strptime(ts_str, fmt)
-                timestamps[ts_str].append(subvol)
+                # Group by minute (first 13 chars of YYYYMMDDTHHMMSS)
+                minute_key = ts_str[:13]
+                groups[minute_key][subvol] = ts_str
                 break
             except ValueError:
                 continue
 
-    return [(ts, sorted(subs)) for ts, subs in sorted(timestamps.items())]
+    results = []
+    for minute_key in sorted(groups.keys()):
+        subvol_dict = groups[minute_key]
+        # Use one of the ts_strs for display (they all share the same minute)
+        display_ts = min(subvol_dict.values())
+        # Sort keys for consistent output in join()
+        sorted_subvols = {s: subvol_dict[s] for s in sorted(subvol_dict.keys())}
+        results.append((display_ts, sorted_subvols))
+
+    return results
 
 
 def get_machine_id():

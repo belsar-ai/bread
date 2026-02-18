@@ -7,8 +7,7 @@ from bread import lib
 STATS = {"created": 0, "pruned": 0, "errors": 0}
 
 
-def create_snapshot(subvol_name):
-    now = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+def create_snapshot(subvol_name, now):
     src = os.path.join(lib.MOUNT_POINT, subvol_name)
     dst = os.path.join(lib.SNAP_DIR, f"{subvol_name}.{now}")
 
@@ -115,7 +114,7 @@ def main():
     now = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     for sub in lib.discover_subvolumes():
         try:
-            create_snapshot(sub)
+            create_snapshot(sub, now)
             prune_snapshots(sub)
         except Exception:
             STATS["errors"] += 1

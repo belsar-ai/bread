@@ -7,7 +7,7 @@ from bread import lib
 def select_subvolumes(available):
     """Prompt for subvolume selection. Enter = All. Supports comma-separated."""
     print("\nRoll back which subvolumes?")
-    options = ["All (Recommended)"] + available
+    options = ["All (Recommended)"] + list(available)
     for i, opt in enumerate(options, 1):
         print(f"  {i}) {opt}")
 
@@ -95,11 +95,11 @@ def main():
     else:
         selected = select_subvolumes(available)
 
-    plan = {sub: ts_str for sub in selected}
+    plan = {sub: available[sub] for sub in selected}
 
     print("\nRollback Plan:")
     for sub in selected:
-        date, time = lib.format_ts(ts_str)
+        date, time = lib.format_ts(available[sub])
         print(f"  {sub}  \u2192  {date} {time}")
 
     if not args.yes:
