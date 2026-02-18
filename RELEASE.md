@@ -63,4 +63,7 @@ sudo dnf install bread
 
 ## Version History
 
+- `v0.3.0` - Group snapshots by minute, remove `revert` command, and automate `old/` cleanup
+- `v0.2.1` - Internal CI/Packit permission fixes
+- `v0.2.0` - Initial GUI release and improved retention logic
 - `v0.1.0` - Initial release
