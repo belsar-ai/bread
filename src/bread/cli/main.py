@@ -9,7 +9,6 @@ COMMANDS = {
     "config": "Setup wizard",
     "snapshot": "Create snapshots and prune old ones",
     "rollback": "Roll back to a snapshot",
-    "revert": "Undo last rollback",
     "purge": "Remove all bread data and config",
 }
 

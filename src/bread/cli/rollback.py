@@ -43,12 +43,8 @@ def execute_rollback(plan, ts_str):
         )
 
     # Clear undo buffer
-    if os.path.exists(lib.OLD_DIR):
-        for item in os.listdir(lib.OLD_DIR):
-            lib.run_cmd(
-                ["btrfs", "subvolume", "delete", os.path.join(lib.OLD_DIR, item)]
-            )
-    else:
+    lib.clear_old_buffer()
+    if not os.path.exists(lib.OLD_DIR):
         os.makedirs(lib.OLD_DIR)
 
     # For each subvolume: move live to old, snapshot restore to live

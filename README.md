@@ -22,7 +22,6 @@ bread config             # setup wizard
 bread snapshot           # create snapshots and prune old ones
 bread rollback <N>       # roll back to snapshot N
 bread rollback <N> -y    # roll back without confirmation
-bread revert             # undo last rollback
 bread-gui                # launch the GUI
 ```
 

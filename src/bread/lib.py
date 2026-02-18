@@ -76,6 +76,19 @@ def check_fstab_safety(interactive=True):
             sys.exit(1)
 
 
+def clear_old_buffer():
+    """Clear the undo buffer (old/) if it exists."""
+    if not os.path.exists(OLD_DIR):
+        return
+    for item in os.listdir(OLD_DIR):
+        path = os.path.join(OLD_DIR, item)
+        if is_btrfs_subvolume(path):
+            try:
+                run_cmd(["btrfs", "subvolume", "delete", path])
+            except Exception as e:
+                print(f"Warning: Failed to delete {path}: {e}", file=sys.stderr)
+
+
 def btrfs_list():
     """Parse `btrfs subvolume list /` into [(path, top_level), ...]."""
     output = subprocess.check_output(["btrfs", "subvolume", "list", "/"], text=True)

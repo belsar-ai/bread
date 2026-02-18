@@ -1,4 +1,3 @@
-import os
 import subprocess
 from gi.repository import Adw, Gtk, GLib
 from bread import lib
@@ -50,10 +49,6 @@ class BreadWindow(Adw.ApplicationWindow):
         self.rollback_btn.set_sensitive(False)
         self.rollback_btn.connect("clicked", self._on_rollback)
         bottom.append(self.rollback_btn)
-
-        self.revert_btn = Gtk.Button(label="Revert Undo")
-        self.revert_btn.connect("clicked", self._on_revert)
-        bottom.append(self.revert_btn)
 
         main_box.append(bottom)
         self.set_content(main_box)
@@ -166,50 +161,6 @@ class BreadWindow(Adw.ApplicationWindow):
 
         dialog = RollbackDialog(self, num, ts_str, subvols)
         dialog.present()
-
-    def _on_revert(self, btn):
-        if not os.path.exists(lib.OLD_DIR):
-            self._show_error("No undo buffer found.")
-            return
-
-        try:
-            items = sorted(
-                i
-                for i in os.listdir(lib.OLD_DIR)
-                if os.path.isdir(os.path.join(lib.OLD_DIR, i))
-            )
-        except Exception:
-            items = []
-
-        if not items:
-            self._show_error("Undo buffer is empty.")
-            return
-
-        dialog = Adw.MessageDialog(
-            transient_for=self,
-            heading="Undo Last Rollback?",
-            body=f"Targets: {', '.join(items)}",
-        )
-        dialog.add_response("cancel", "Cancel")
-        dialog.add_response("revert", "Revert")
-        dialog.set_response_appearance("revert", Adw.ResponseAppearance.DESTRUCTIVE)
-        dialog.connect("response", self._on_revert_response)
-        dialog.present()
-
-    def _on_revert_response(self, dialog, response):
-        if response != "revert":
-            return
-        try:
-            subprocess.run(
-                ["pkexec", "bread", "revert", "--yes"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError as e:
-            self._show_error(e.stderr.strip() or "Revert failed.")
-            return
-        self._show_reboot_dialog("Revert complete.")
 
     def _show_error(self, msg):
         dialog = Adw.MessageDialog(transient_for=self, heading="Error", body=msg)

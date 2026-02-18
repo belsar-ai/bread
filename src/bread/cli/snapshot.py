@@ -111,6 +111,9 @@ def main():
 
     lib.init()
 
+    # Clear undo buffer to reclaim space
+    lib.clear_old_buffer()
+
     now = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     for sub in lib.discover_subvolumes():
         try:
