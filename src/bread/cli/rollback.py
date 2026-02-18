@@ -7,7 +7,7 @@ from bread import lib
 def select_subvolumes(available):
     """Prompt for subvolume selection. Enter = All. Supports comma-separated."""
     print("\nRoll back which subvolumes?")
-    options = ["All (Recommended)"] + available
+    options = ["All (Recommended)"] + list(available)
     for i, opt in enumerate(options, 1):
         print(f"  {i}) {opt}")
 
@@ -43,12 +43,8 @@ def execute_rollback(plan, ts_str):
         )
 
     # Clear undo buffer
-    if os.path.exists(lib.OLD_DIR):
-        for item in os.listdir(lib.OLD_DIR):
-            lib.run_cmd(
-                ["btrfs", "subvolume", "delete", os.path.join(lib.OLD_DIR, item)]
-            )
-    else:
+    lib.clear_old_buffer()
+    if not os.path.exists(lib.OLD_DIR):
         os.makedirs(lib.OLD_DIR)
 
     # For each subvolume: move live to old, snapshot restore to live
@@ -95,11 +91,11 @@ def main():
     else:
         selected = select_subvolumes(available)
 
-    plan = {sub: ts_str for sub in selected}
+    plan = {sub: available[sub] for sub in selected}
 
     print("\nRollback Plan:")
     for sub in selected:
-        date, time = lib.format_ts(ts_str)
+        date, time = lib.format_ts(available[sub])
         print(f"  {sub}  \u2192  {date} {time}")
 
     if not args.yes:
